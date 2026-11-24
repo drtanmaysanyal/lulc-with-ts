@@ -10,6 +10,7 @@ import datetime
 import io
 import json
 import math
+import textwrap
 
 import ee
 import numpy as np
@@ -20,6 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from PIL import Image as PILImage
 from reportlab.lib import colors
@@ -69,7 +71,7 @@ SEASONS = {
     "Nov-Feb (dry season, best for South Asia)": (11, 2),
     "Whole year": None,
 }
-RADII_KM = [1, 5, 10, 50]
+RADII_KM = [5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 R_EARTH = 6378137.0
 
 
@@ -136,15 +138,15 @@ def _prep(key):
     return f
 
 
-def composite(year, region, season):
-    """Cloud-free median composite of (year-1 ... year+1)."""
-    keys = sorted({k for y in (year - 1, year, year + 1)
+def composite(year, region, season, win=1):
+    """Cloud-free median composite of (year-win ... year+win)."""
+    keys = sorted({k for y in range(year - win, year + win + 1)
                    for k in sensors_for(y)})
     merged = None
     for k in keys:
         col = (ee.ImageCollection(SENSORS[k][0])
                .filterBounds(region)
-               .filterDate(f"{year - 1}-01-01", f"{year + 2}-01-01"))
+               .filterDate(f"{year - win}-01-01", f"{year + win + 1}-01-01"))
         if season:
             m0, m1 = season  # e.g. (11, 2) = Nov..Feb
             col = col.filter(ee.Filter.Or(
@@ -229,8 +231,8 @@ def osm_lines(lat, lon, r_km):
     """Major roads and canals/rivers (current OSM) in Web-Mercator coords."""
     out = {"major": [], "minor": [], "water": []}
     r = int(r_km * 1000)
-    hw = ("motorway|trunk|primary|secondary" if r_km > 10
-          else "motorway|trunk|primary|secondary|tertiary")
+    hw = ("motorway|trunk|primary" if r_km > 30
+          else "motorway|trunk|primary|secondary")
     q = (f'[out:json][timeout:30];('
          f'way["highway"~"^({hw})$"](around:{r},{lat},{lon});'
          f'way["waterway"~"^(river|canal)$"](around:{r},{lat},{lon});'
@@ -266,13 +268,14 @@ def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2):
     xmin, ymin, xmax, ymax = ext
     aspect = (ymax - ymin) / (xmax - xmin)
     pw = 5.2
-    figw, figh = pw * ncols, pw * aspect * nrows + 1.0
+    side = 2.7  # width reserved for the legend column
+    figw, figh = pw * ncols + side, pw * aspect * nrows + 0.8
     fig, axes = plt.subplots(nrows, ncols, figsize=(figw, figh), dpi=150,
                              squeeze=False)
     cx, cy = zip(*[merc(x, y) for x, y in circle_lonlat(lat, lon, r_km)])
     cos_lat = math.cos(math.radians(lat))
     width_km = (xmax - xmin) * cos_lat / 1000.0
-    nice = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]
+    nice = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
     bar_km = max([v for v in nice if v <= 0.3 * width_km] or [nice[0]])
     bar_frac = bar_km * 1000.0 / cos_lat / (xmax - xmin)
 
@@ -284,15 +287,19 @@ def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2):
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
         ax.set_aspect("equal")
+        ax.set_facecolor("#f4f4f4")
         if ctx is not None:
-            try:
-                ctx.add_basemap(ax, crs="EPSG:3857",
-                                source=ctx.providers.CartoDB.Positron,
-                                attribution=False)
-            except Exception:
-                ax.set_facecolor("#f4f4f4")
-        else:
-            ax.set_facecolor("#f4f4f4")
+            # Esri Light Gray Canvas needs no API key (CARTO now requires one)
+            zoom = int(min(max(round(math.log2(
+                156543.03 * 1000.0 / (xmax - xmin))), 1), 15))
+            for provider in (ctx.providers.Esri.WorldGrayCanvas,
+                             ctx.providers.OpenStreetMap.Mapnik):
+                try:
+                    ctx.add_basemap(ax, crs="EPSG:3857", source=provider,
+                                    zoom=zoom, attribution=False)
+                    break
+                except Exception:
+                    continue
         arr = np.array(PILImage.open(io.BytesIO(data)).convert("RGBA"))
         arr = arr.astype(float)
         arr[..., 3] *= 0.85
@@ -327,12 +334,14 @@ def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2):
                 bbox=dict(facecolor="white", edgecolor="none", pad=1.5,
                           alpha=0.8))
 
-    bottom = 1.0 / figh
-    fig.tight_layout(rect=(0, bottom, 1, 1))
-    fig.legend(handles=legend, loc="lower center",
-               bbox_to_anchor=(0.5, 0.28 / figh), ncol=3, fontsize=8,
-               frameon=False)
-    fig.text(0.5, 0.06 / figh, note, ha="center", fontsize=6, color="#555555")
+    bottom = 0.8 / figh
+    fig.tight_layout(rect=(0, bottom, 1 - side / figw, 1), w_pad=2.0, h_pad=1.5)
+    fig.legend(handles=legend, loc="center right",
+               bbox_to_anchor=(0.995, 0.5 + bottom / 2), title="Legend",
+               title_fontsize=9, fontsize=8, frameon=True, edgecolor="black",
+               fancybox=False, borderpad=0.8, labelspacing=0.7)
+    fig.text(0.5, 0.05 / figh, textwrap.fill(note, int(figw * 19)),
+             ha="center", va="bottom", fontsize=6, color="#555555")
     buf = io.BytesIO()
     fig.savefig(buf, format="png")
     plt.close(fig)
@@ -341,8 +350,8 @@ def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2):
 
 MAP_NOTE = ("Land cover: Landsat (USGS/NASA), rule-based classification. "
             "Roads (red/grey) and canals/rivers (blue lines): OpenStreetMap "
-            "contributors (current, for reference). Basemap: (c) OpenStreetMap "
-            "contributors (c) CARTO. Dashed line = study radius.")
+            "contributors (current, for reference). Basemap: Esri, HERE, Garmin, "
+            "OpenStreetMap contributors. Dashed line = study radius.")
 
 
 # --------------------------------------------------------------------------
@@ -350,7 +359,8 @@ MAP_NOTE = ("Land cover: Landsat (USGS/NASA), rule-based classification. "
 # --------------------------------------------------------------------------
 def run_analysis(lat, lon, r_km, years, season, progress):
     region = ee.Geometry.Point([lon, lat]).buffer(r_km * 1000)
-    scale = 30 if r_km <= 10 else 100
+    scale = 30 if r_km <= 10 else 60 if r_km <= 30 else 100 if r_km <= 60 else 150
+    win = 1 if r_km <= 30 else 0  # one-year window for very large areas
     w, s, e, n = bbox(region)
     rect = ee.Geometry.Rectangle([w, s, e, n], "EPSG:4326", False)
     x0, y0 = merc(w, s)
@@ -361,7 +371,7 @@ def run_analysis(lat, lon, r_km, years, season, progress):
     classes, areas, ndvi_mean, scenes, pngs = {}, {}, {}, {}, {}
     for y in years:
         progress(f"Processing {y}: composite, classification, statistics...")
-        img, k = composite(y, region, season)
+        img, k = composite(y, region, season, win)
         c, nd = classify(img)
         classes[y] = c
         scenes[y] = k
@@ -395,8 +405,12 @@ def run_analysis(lat, lon, r_km, years, season, progress):
     g1, g2 = gbif(lat, lon, r_km, first), gbif(lat, lon, r_km, last)
 
     progress("Drawing maps...")
+    road_items = [Line2D([0], [0], color="#d7191c", lw=1.8, label="Main road"),
+                  Line2D([0], [0], color="#9e9e9e", lw=1.0, label="Other road"),
+                  Line2D([0], [0], color="#0b4ea2", lw=1.8, label="Canal / river"),
+                  Line2D([0], [0], color="black", lw=1.1, ls="--", label="Study radius")]
     legend = [Patch(facecolor=CLASSES[k][1], edgecolor="black", label=CLASSES[k][0])
-              for k in sorted(CLASSES)]
+              for k in sorted(CLASSES)] + road_items
     lulc_map = draw_map([(str(y), pngs[y]) for y in years], ext, lat, lon,
                         r_km, osm, legend, MAP_NOTE, ncols=2)
     wlegend = [Patch(facecolor="#1f78b4", edgecolor="black", label="Unchanged water"),
@@ -405,7 +419,7 @@ def run_analysis(lat, lon, r_km, years, season, progress):
     water_map = draw_map([(f"{first}-{last}", water_png)], ext, lat, lon,
                          r_km, osm, wlegend, MAP_NOTE)
 
-    dec = 3 if r_km <= 1 else 2 if r_km <= 10 else 1
+    dec = 2 if r_km <= 10 else 1
     return dict(lat=lat, lon=lon, r_km=r_km, years=years, scale=scale,
                 season=("Nov-Feb" if season else "Whole year"), dec=dec,
                 scenes=scenes, a=areas, trans=trans, ndvi=ndvi_mean,
