@@ -194,7 +194,7 @@ def train_model(train_img, region, scale):
     stack = features(train_img).select(FEATURES).addBands(label)
     samples = stack.stratifiedSample(
         numPoints=0, classBand="label", region=region, scale=scale,
-        classValues=TRAIN_CLASSES, classPoints=[400] * len(TRAIN_CLASSES),
+        classValues=TRAIN_CLASSES, classPoints=[500] * len(TRAIN_CLASSES),
         seed=42, tileScale=4, dropNulls=True)
     n = samples.size().getInfo()
     if n < 100:
@@ -434,13 +434,10 @@ def run_analysis(lat, lon, r_km, years, season, progress):
     imgs, scenes = {}, {}
     for y in years:
         imgs[y], scenes[y] = composite(y, region, season, win)
-    train_img = (imgs[2020] if 2020 in imgs
-                 else composite(2020, region, season, win)[0])
-    progress("Training Random Forest on ESA WorldCover labels...")
-    clf, acc = train_model(train_img, region, scale)
-
-    classes, areas, ndvi_mean, pngs, built = {}, {}, {}, {}, {}
+    classes, areas, ndvi_mean, pngs, built, acc = {}, {}, {}, {}, {}, {}
     for y in years:
+        progress(f"Training Random Forest for {y} (that year's own imagery)...")
+        clf, acc[y] = train_model(imgs[y], region, scale)
         progress(f"Classifying and measuring {y}...")
         c = classify_year(imgs[y], clf, y)
         classes[y] = c
@@ -508,11 +505,13 @@ def reliability_flags(r):
     a1, a2 = r["a"][y1], r["a"][y2]
     area = math.pi * r["r_km"] ** 2
     flags = []
-    acc = r.get("acc")
-    if acc and acc["overall"] < 0.75:
-        flags.append(f"Classification accuracy is low "
-                     f"({acc['overall'] * 100:.0f}%); treat class areas as "
-                     "rough estimates.")
+    acc = r.get("acc") or {}
+    if acc:
+        worst = min(v["overall"] for v in acc.values())
+        if worst < 0.75:
+            flags.append(f"Agreement with the reference labels is low "
+                         f"({worst * 100:.0f}%); treat class areas as rough "
+                         "estimates.")
     p1, p2 = r["p1"], r["p2"]
     pop_up = bool(p1 and p2 and p1["value"] and p2["value"]
                   and p2["value"] >= p1["value"])
@@ -580,10 +579,13 @@ def insights(r):
                    "habitat pressure on wildlife.")
     acc = r.get("acc")
     if acc:
-        out.append(f"Classification accuracy on held-out points: "
-                   f"{acc['overall'] * 100:.0f}% (kappa {acc['kappa']:.2f}). "
-                   "Earlier years use a model trained on 2020 data, so older "
-                   "maps carry more uncertainty.")
+        parts = ", ".join(f"{y}: {v['overall'] * 100:.0f}%"
+                          for y, v in acc.items())
+        out.append(f"Classification accuracy on held-out points ({parts}). "
+                   "Each year's model learns from that year's own imagery "
+                   "with WorldCover 2020 labels, which removes sensor bias "
+                   "but damps real change, so change figures are "
+                   "conservative.")
     return out
 
 
@@ -681,10 +683,10 @@ def build_pdf(r):
               ["Image season", r["season"]],
               ["Landsat scenes used", " / ".join(str(r["scenes"][y]) for y in years)],
               ["Analysis resolution", f"{r['scale']} m"],
-              ["Classifier", "Random Forest (100 trees), ESA WorldCover 2020 labels"],
+              ["Classifier", "Random Forest (100 trees), one model per year, ESA WorldCover 2020 labels"],
               ["Accuracy (held-out points)",
-               f"{r['acc']['overall'] * 100:.1f}% (kappa {r['acc']['kappa']:.2f}, "
-               f"{r['acc']['n']} samples)"]],
+               ", ".join(f"{y}: {v['overall'] * 100:.1f}% (kappa {v['kappa']:.2f})"
+                         for y, v in r["acc"].items())]],
              [6 * cm, 11 * cm])]
 
     s.append(Paragraph("1. Summary of findings", h2))
@@ -764,12 +766,15 @@ def build_pdf(r):
         "season; Landsat 8/9 adjusted to Landsat 5/7 equivalent values, Roy "
         "et al. 2016) plus NDVI, MNDWI and NDBI. Built-up land comes from the "
         "JRC Global Human Settlement Layer (GHS-BUILT-S, 5-year epochs; a "
-        "100 m cell counts as built-up above 10% built surface). Accuracy is "
-        "measured on 30% held-out sample points of the training year (a "
-        "random split, so it is optimistic). Earlier decades are classified "
-        "by applying the 2020-trained model to older imagery, which adds "
-        "uncertainty, and the 30 m resolution cannot resolve narrow canals or "
-        "small ponds. Roads and canals drawn on the maps come from current "
+        "100 m cell counts as built-up above 10% built surface). A separate "
+        "model is trained for each year on that year's own imagery, using "
+        "WorldCover 2020 labels as a proxy for stable land cover. This "
+        "removes sensor and season bias between decades but assumes most land "
+        "did not change, so real change is damped and change figures are "
+        "conservative. Accuracy is measured on 30% held-out points of each "
+        "year (a random split, so it is optimistic; for earlier years it also "
+        "absorbs real change since 2020). The 30 m resolution cannot resolve "
+        "narrow canals or small ponds. Roads and canals drawn on the maps come from current "
         "OpenStreetMap data and are shown for orientation only. This is a "
         "beta, screening-level analysis, not field-verified.", body))
 
