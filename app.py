@@ -1,5 +1,5 @@
 """
-LULC Change Analysis Tool Beta  (v2: publication-style maps)
+LULC Change Analysis Tool  (v2: publication-style maps)
 -------------------------------------------------------
 User gives latitude, longitude, a period and a radius.
 Google Earth Engine (Landsat) -> land cover for each year -> change statistics,
@@ -73,6 +73,10 @@ SEASONS = {
     "Nov-Feb (dry season, best for South Asia)": (11, 2),
     "Whole year": None,
 }
+# OLI (Landsat 8/9) -> ETM+ (Landsat 5/7) surface-reflectance harmonization
+# (Roy et al. 2016, OLS): ETM+ = slope * OLI + intercept, bands blue..swir2
+OLI_SLOPE = [0.8474, 0.8483, 0.9047, 0.8462, 0.8937, 0.9071]
+OLI_INTERCEPT = [0.0003, 0.0088, 0.0061, 0.0412, 0.0254, 0.0172]
 RADII_KM = [5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 R_EARTH = 6378137.0
 
@@ -134,7 +138,12 @@ def _prep(key):
         qa = img.select("QA_PIXEL")  # bit mask: never resample this band
         clear = qa.bitwiseAnd(1 << 3).eq(0).And(qa.bitwiseAnd(1 << 4).eq(0))
         sr = (img.select(src, NAMES).resample("bilinear")
-              .multiply(0.0000275).add(-0.2).updateMask(clear))
+              .multiply(0.0000275).add(-0.2))
+        if key in ("L8", "L9"):  # make OLI comparable with TM/ETM+
+            slope = ee.Image.constant(OLI_SLOPE).rename(NAMES)
+            icpt = ee.Image.constant(OLI_INTERCEPT).rename(NAMES)
+            sr = sr.multiply(slope).add(icpt)
+        sr = sr.updateMask(clear)
         return sr.copyProperties(img, ["system:time_start"])
 
     return f
@@ -437,12 +446,39 @@ def pct(a, b):
     return (b - a) / a * 100.0 if a else 0.0
 
 
+def reliability_flags(r):
+    """Plausibility checks: flag results that look like classification artefacts."""
+    y1, y2 = r["years"][0], r["years"][-1]
+    a1, a2 = r["a"][y1], r["a"][y2]
+    flags = []
+    p1, p2 = r["p1"], r["p2"]
+    pop_up = bool(p1 and p2 and p1["value"] and p2["value"]
+                  and p2["value"] >= p1["value"])
+    if pct(a1[4], a2[4]) < -30 and pop_up:
+        flags.append("Built-up area decreased sharply while population "
+                     "did not; this is very likely a classification "
+                     "inconsistency between the two years (sensor, season "
+                     "or thresholds), not a real change.")
+    dense = pct(a1[2], a2[2])
+    if dense > 100 or dense < -60:
+        flags.append(f"Dense vegetation changed by {dense:+.0f}%, which is "
+                     "unusually large and probably reflects different image "
+                     "dates, sensors or crop stage rather than real land "
+                     "change.")
+    if abs(r["ndvi"][y2] - r["ndvi"][y1]) > 0.08:
+        flags.append("Mean NDVI differs strongly between the two years; "
+                     "treat the vegetation numbers as unreliable until "
+                     "checked against local knowledge or high-resolution "
+                     "imagery.")
+    return flags
+
+
 def insights(r):
     d = r["dec"]
     y1, y2 = r["years"][0], r["years"][-1]
     a1, a2 = r["a"][y1], r["a"][y2]
     area = math.pi * r["r_km"] ** 2
-    out = []
+    out = ["RELIABILITY WARNING: " + f for f in reliability_flags(r)]
     v1, v2 = a1[2] + a1[3], a2[2] + a2[3]
     out.append(f"Vegetation (dense + sparse) changed from {v1:.{d}f} km2 to "
                f"{v2:.{d}f} km2 ({pct(v1, v2):+.1f}%). Dense vegetation "
@@ -472,6 +508,11 @@ def insights(r):
         else:
             out.append(f"Recorded animal species (GBIF): {g1['species']} "
                        f"around {y1} vs {g2['species']} around {y2}.")
+            if g1["records"] and g2["records"] / g1["records"] > 3:
+                out.append("The rise in animal records mainly reflects "
+                           "growing citizen-science observation effort "
+                           "(e.g. eBird, iNaturalist), not necessarily more "
+                           "wildlife.")
     if a1[2] - a2[2] > 0 and a2[4] > a1[4]:
         out.append("Dense vegetation loss together with built-up growth "
                    "suggests habitat fragmentation pressure on wildlife.")
@@ -643,6 +684,8 @@ def build_pdf(r):
         "Land cover is derived from cloud-masked Landsat 5/7/8/9 Collection 2 "
         "Level-2 surface reflectance (median composite of the year before, "
         "the year, and the year after, restricted to the chosen season). "
+        "Landsat 8/9 reflectance is adjusted to Landsat 5/7 equivalent values "
+        "(Roy et al. 2016) so different decades are comparable. "
         "Classes use index thresholds: NDVI (vegetation), MNDWI (water) and "
         "NDBI (built-up). This is a rule-based classification at 30 m "
         "resolution, not field-verified; accuracy is lower for early years, "
