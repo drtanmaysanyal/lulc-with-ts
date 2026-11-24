@@ -3,3 +3,6 @@ earthengine-api
 requests
 matplotlib
 reportlab
+numpy
+pillow
+contextily
