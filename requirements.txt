@@ -1,0 +1,5 @@
+streamlit
+earthengine-api
+requests
+matplotlib
+reportlab
