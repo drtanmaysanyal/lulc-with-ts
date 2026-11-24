@@ -1,5 +1,5 @@
 """
-LULC Change Analysis Tool  (v2: publication-style maps)
+LULC Change Analysis Tool Beta  (v2: publication-style maps)
 -------------------------------------------------------
 User gives latitude, longitude, a period and a radius.
 Google Earth Engine (Landsat) -> land cover for each year -> change statistics,
@@ -39,7 +39,9 @@ except Exception:  # basemap is optional
 # --------------------------------------------------------------------------
 # Settings
 # --------------------------------------------------------------------------
-SITE_NAME = "tanmoychannel.in"
+SITE_NAME = "www.tanmaysanyal.in"
+BOTTLE = "#0B5D45"   # bottle green
+BEIGE = "#F5F0E1"    # beige
 
 CLASSES = {
     1: ("Water / pond / river", "#1f78b4"),
@@ -318,6 +320,9 @@ def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2):
         ax.set_yticks([])
         for sp in ax.spines.values():
             sp.set_linewidth(1.8)
+        ax.text(0.5, 0.5, SITE_NAME, transform=ax.transAxes, rotation=30,
+                ha="center", va="center", fontsize=15, fontweight="bold",
+                color="#0B5D45", alpha=0.20, zorder=9)
         ax.text(0.04, 0.04, title, transform=ax.transAxes, zorder=10,
                 fontsize=17 if len(title) <= 5 else 11, fontweight="bold",
                 bbox=dict(facecolor="white", edgecolor="black", pad=4))
@@ -348,7 +353,7 @@ def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2):
     return buf.getvalue()
 
 
-MAP_NOTE = ("Land cover: Landsat (USGS/NASA), rule-based classification. "
+MAP_NOTE = (f"{SITE_NAME} | Land cover: Landsat (USGS/NASA), rule-based classification. "
             "Roads (red/grey) and canals/rivers (blue lines): OpenStreetMap "
             "contributors (current, for reference). Basemap: Esri, HERE, Garmin, "
             "OpenStreetMap contributors. Dashed line = study radius.")
@@ -483,7 +488,7 @@ def insights(r):
 def chart_bytes(r):
     codes = sorted(CLASSES)
     years = r["years"]
-    shades = plt.cm.Blues(np.linspace(0.35, 0.95, len(years)))
+    shades = plt.cm.Greens(np.linspace(0.35, 0.95, len(years)))
     fig, ax = plt.subplots(figsize=(7.5, 3.6), dpi=150)
     bw = 0.8 / len(years)
     for j, y in enumerate(years):
@@ -511,6 +516,28 @@ def img_flow(data, width_cm):
                  height=width_cm * cm * h / w)
 
 
+def _page_mark(canvas, doc):
+    """Diagonal watermark (behind content) + footer on every PDF page."""
+    w, h = A4
+    canvas.saveState()
+    canvas.setFillColor(colors.HexColor("#0B5D45"))
+    canvas.setFillAlpha(0.09)
+    canvas.setFont("Helvetica-Bold", 34)
+    for fy in (0.22, 0.50, 0.78):
+        canvas.saveState()
+        canvas.translate(w / 2, h * fy)
+        canvas.rotate(40)
+        canvas.drawCentredString(0, 0, SITE_NAME)
+        canvas.restoreState()
+    canvas.restoreState()
+    canvas.saveState()
+    canvas.setFont("Helvetica", 8)
+    canvas.setFillColor(colors.HexColor("#555555"))
+    canvas.drawString(2 * cm, 1 * cm, f"{SITE_NAME}  |  LULC Change Report")
+    canvas.drawRightString(w - 2 * cm, 1 * cm, f"Page {doc.page}")
+    canvas.restoreState()
+
+
 def build_pdf(r):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=2 * cm,
@@ -519,7 +546,7 @@ def build_pdf(r):
     ss = getSampleStyleSheet()
     h1 = ParagraphStyle("h1", parent=ss["Title"], fontSize=20, spaceAfter=4)
     h2 = ParagraphStyle("h2", parent=ss["Heading2"],
-                        textColor=colors.HexColor("#273c75"))
+                        textColor=colors.HexColor("#0B5D45"))
     body = ParagraphStyle("b", parent=ss["BodyText"], fontSize=9.5, leading=13)
     small = ParagraphStyle("s", parent=body, fontSize=8, textColor=colors.grey)
     d = r["dec"]
@@ -529,12 +556,12 @@ def build_pdf(r):
     def tbl(data, widths=None):
         t = Table(data, colWidths=widths, repeatRows=1)
         t.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#273c75")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B5D45")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("FONTSIZE", (0, 0), (-1, -1), 8.5),
             ("GRID", (0, 0), (-1, -1), 0.3, colors.lightgrey),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-             [colors.white, colors.HexColor("#f1f2f6")]),
+             [colors.white, colors.HexColor("#EFE8D4")]),
             ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
         ]))
         return t
@@ -624,7 +651,7 @@ def build_pdf(r):
         "from current OpenStreetMap data and are shown for orientation only. "
         "Use results as a screening-level analysis.", body))
 
-    doc.build(s)
+    doc.build(s, onFirstPage=_page_mark, onLaterPages=_page_mark)
     buf.seek(0)
     return buf.getvalue()
 
@@ -632,10 +659,51 @@ def build_pdf(r):
 # --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
-st.set_page_config(page_title="LULC Change Analyzer", page_icon="🛰️",
-                   layout="centered")
-st.title("🛰️ LULC Change Analyzer")
-st.caption("Land use and land cover change for any location, with maps and a PDF report.")
+st.set_page_config(page_title="LULC Change Analyzer | www.tanmaysanyal.in",
+                   page_icon="🛰️", layout="centered")
+
+THEME_CSS = """
+<style>
+.stApp { background: #F5F0E1; }
+.stMarkdown, .stMarkdown p, .stMarkdown li, label, h1, h2, h3,
+[data-testid="stCaptionContainer"], [data-testid="stWidgetLabel"] p
+{ color: #1E2B25 !important; }
+.block-container { padding-top: 2rem; padding-bottom: 4.5rem; }
+div[data-testid="stForm"] { background: #EDE5CF; border: 1px solid #0B5D45;
+                            border-radius: 12px; }
+div[data-baseweb="input"], div[data-baseweb="select"] > div
+{ background: #FFFDF6 !important; }
+div[data-baseweb="input"] input, div[data-baseweb="select"] div
+{ color: #1E2B25 !important; }
+div.stButton > button, div[data-testid="stFormSubmitButton"] > button,
+div[data-testid="stDownloadButton"] > button
+{ background: #0B5D45; border: 1px solid #0B5D45; border-radius: 8px; }
+div.stButton > button p, div[data-testid="stFormSubmitButton"] > button p,
+div[data-testid="stDownloadButton"] > button p { color: #F5F0E1 !important; }
+div.stButton > button:hover, div[data-testid="stFormSubmitButton"] > button:hover,
+div[data-testid="stDownloadButton"] > button:hover { background: #08473A; }
+.site-banner { background: #0B5D45; border-radius: 12px; padding: 18px 22px;
+               margin-bottom: 16px; }
+.site-banner .t { color: #F5F0E1 !important; font-size: 1.9rem;
+                  font-weight: 700; line-height: 1.2; }
+.site-banner .s { color: #E7DDBF !important; font-size: 0.95rem;
+                  margin-top: 4px; }
+.site-footer { position: fixed; left: 0; right: 0; bottom: 0; z-index: 1000;
+               background: #0B5D45; color: #F5F0E1; text-align: center;
+               padding: 7px 10px; font-size: 0.85rem; letter-spacing: 0.3px; }
+.stApp::before { content: ""; position: fixed; inset: 0; z-index: 999;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='380' height='230'><text x='24' y='150' transform='rotate(-25 190 115)' font-family='Arial' font-size='22' font-weight='bold' fill='rgb(11,93,69)' fill-opacity='0.09'>www.tanmaysanyal.in</text></svg>"); }
+</style>
+"""
+st.markdown(THEME_CSS, unsafe_allow_html=True)
+st.markdown(
+    '<div class="site-banner"><div class="t">🛰️ LULC Change Analyzer</div>'
+    '<div class="s">Land use &amp; land cover change tool &nbsp;|&nbsp; '
+    '<b>www.tanmaysanyal.in</b></div></div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="site-footer">www.tanmaysanyal.in &nbsp;·&nbsp; '
+    'LULC Change Analyzer</div>', unsafe_allow_html=True)
 
 with st.form("inputs"):
     c1, c2 = st.columns(2)
