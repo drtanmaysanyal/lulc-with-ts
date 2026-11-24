@@ -1,29 +1,38 @@
 """
-LULC Change Analysis Tool
--------------------------
-User gives latitude, longitude, a 10-year period and a radius.
-The app uses Google Earth Engine (Landsat) to classify land cover for both
-years, measures the change (vegetation, built-up, water/river path),
-adds population (GHSL) and wildlife records (GBIF), and builds a PDF report.
+LULC Change Analysis Tool  (v2: publication-style maps)
+-------------------------------------------------------
+User gives latitude, longitude, a period and a radius.
+Google Earth Engine (Landsat) -> land cover for each year -> change statistics,
+framed maps on a basemap with roads/canals, population (GHSL), wildlife (GBIF),
+and a downloadable PDF report.
 """
+import datetime
 import io
 import json
 import math
-import datetime
 
 import ee
+import numpy as np
 import requests
 import streamlit as st
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib.patches import Patch
+from PIL import Image as PILImage
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
-from reportlab.platypus import (Image, Paragraph, SimpleDocTemplate, Spacer,
-                                Table, TableStyle)
+from reportlab.platypus import (Image, KeepTogether, Paragraph,
+                                SimpleDocTemplate, Spacer, Table, TableStyle)
+
+try:
+    import contextily as ctx
+except Exception:  # basemap is optional
+    ctx = None
 
 # --------------------------------------------------------------------------
 # Settings
@@ -31,11 +40,11 @@ from reportlab.platypus import (Image, Paragraph, SimpleDocTemplate, Spacer,
 SITE_NAME = "tanmoychannel.in"
 
 CLASSES = {
-    1: ("Water", "#1f78b4"),
+    1: ("Water / pond / river", "#1f78b4"),
     2: ("Dense vegetation", "#1b7837"),
     3: ("Sparse vegetation / cropland", "#a6d96a"),
-    4: ("Built-up", "#d7191c"),
-    5: ("Bare land / other", "#e0c9a6"),
+    4: ("Built-up / settlement", "#e6550d"),
+    5: ("Bare land / other", "#f2e394"),
 }
 PALETTE = [CLASSES[k][1].lstrip("#") for k in sorted(CLASSES)]
 
@@ -51,11 +60,42 @@ SENSORS = {
            ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"]),
 }
 PERIODS = {
-    "1990 to 2000": (1990, 2000),
-    "2000 to 2010": (2000, 2010),
-    "2010 to 2020": (2010, 2020),
+    "1990 to 2000": [1990, 2000],
+    "2000 to 2010": [2000, 2010],
+    "2010 to 2020": [2010, 2020],
+    "1990 to 2020 (4 maps)": [1990, 2000, 2010, 2020],
+}
+SEASONS = {
+    "Nov-Feb (dry season, best for South Asia)": (11, 2),
+    "Whole year": None,
 }
 RADII_KM = [1, 5, 10, 50]
+R_EARTH = 6378137.0
+
+
+# --------------------------------------------------------------------------
+# Geometry helpers
+# --------------------------------------------------------------------------
+def merc(lon, lat):
+    x = R_EARTH * math.radians(lon)
+    y = R_EARTH * math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+    return x, y
+
+
+def circle_lonlat(lat, lon, r_km, n=96):
+    pts = []
+    for i in range(n):
+        a = 2 * math.pi * i / n
+        dlat = (r_km / 111.32) * math.sin(a)
+        dlon = (r_km / (111.32 * math.cos(math.radians(lat)))) * math.cos(a)
+        pts.append((lon + dlon, lat + dlat))
+    pts.append(pts[0])
+    return pts
+
+
+def circle_wkt(lat, lon, r_km):
+    pts = circle_lonlat(lat, lon, r_km, 48)
+    return "POLYGON((" + ",".join(f"{x:.5f} {y:.5f}" for x, y in pts) + "))"
 
 
 # --------------------------------------------------------------------------
@@ -87,16 +127,16 @@ def _prep(key):
     _, src = SENSORS[key]
 
     def f(img):
-        qa = img.select("QA_PIXEL")
+        qa = img.select("QA_PIXEL")  # bit mask: never resample this band
         clear = qa.bitwiseAnd(1 << 3).eq(0).And(qa.bitwiseAnd(1 << 4).eq(0))
-        sr = (img.select(src, NAMES).multiply(0.0000275).add(-0.2)
-              .updateMask(clear))
+        sr = (img.select(src, NAMES).resample("bilinear")
+              .multiply(0.0000275).add(-0.2).updateMask(clear))
         return sr.copyProperties(img, ["system:time_start"])
 
     return f
 
 
-def composite(year, region):
+def composite(year, region, season):
     """Cloud-free median composite of (year-1 ... year+1)."""
     keys = sorted({k for y in (year - 1, year, year + 1)
                    for k in sensors_for(y)})
@@ -104,12 +144,18 @@ def composite(year, region):
     for k in keys:
         col = (ee.ImageCollection(SENSORS[k][0])
                .filterBounds(region)
-               .filterDate(f"{year - 1}-01-01", f"{year + 2}-01-01")
-               .map(_prep(k)))
+               .filterDate(f"{year - 1}-01-01", f"{year + 2}-01-01"))
+        if season:
+            m0, m1 = season  # e.g. (11, 2) = Nov..Feb
+            col = col.filter(ee.Filter.Or(
+                ee.Filter.calendarRange(m0, 12, "month"),
+                ee.Filter.calendarRange(1, m1, "month")))
+        col = col.map(_prep(k))
         merged = col if merged is None else merged.merge(col)
     n = merged.size().getInfo()
     if n == 0:
-        raise RuntimeError(f"No Landsat images found for {year}.")
+        raise RuntimeError(
+            f"No usable Landsat images for {year}. Try 'Whole year'.")
     return merged.median().clip(region), n
 
 
@@ -127,7 +173,6 @@ def classify(img):
 
 
 def area_by(code_img, region, scale):
-    """Area (km2) per integer code in a one-band image."""
     r = (ee.Image.pixelArea().divide(1e6).addBands(code_img)
          .reduceRegion(reducer=ee.Reducer.sum().group(1, "c"),
                        geometry=region, scale=scale,
@@ -135,10 +180,18 @@ def area_by(code_img, region, scale):
     return {int(g["c"]): g["sum"] for g in r.get("groups", [])}
 
 
-def png(img, region, vis):
+def bbox(region):
+    co = region.bounds().coordinates().getInfo()[0]
+    xs = [p[0] for p in co]
+    ys = [p[1] for p in co]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def png(img, rect, vis, dim=1000):
     url = img.visualize(**vis).getThumbURL(
-        {"region": region.bounds(), "dimensions": 600, "format": "png"})
-    resp = requests.get(url, timeout=120)
+        {"region": rect, "dimensions": dim, "crs": "EPSG:3857",
+         "format": "png"})
+    resp = requests.get(url, timeout=180)
     resp.raise_for_status()
     return resp.content
 
@@ -148,39 +201,22 @@ def population(year, region):
         epoch = min(max(int(round(year / 5.0)) * 5, 1975), 2030)
         img = ee.Image(f"JRC/GHSL/P2023A/GHS_POP/{epoch}").select(
             "population_count")
-        v = img.reduceRegion(ee.Reducer.sum(), region, 100,
-                             maxPixels=1e10, bestEffort=True
-                             ).get("population_count").getInfo()
+        v = img.reduceRegion(ee.Reducer.sum(), region, 100, maxPixels=1e10,
+                             bestEffort=True).get("population_count").getInfo()
         return {"epoch": epoch, "value": v}
     except Exception:
         return None
 
 
 # --------------------------------------------------------------------------
-# GBIF (wildlife records)
+# External data: GBIF (wildlife) and OpenStreetMap (roads, canals)
 # --------------------------------------------------------------------------
-def circle_wkt(lat, lon, r_km, n=48):
-    pts = []
-    for i in range(n):
-        a = 2 * math.pi * i / n
-        dlat = (r_km / 111.32) * math.sin(a)
-        dlon = (r_km / (111.32 * math.cos(math.radians(lat)))) * math.cos(a)
-        pts.append((lon + dlon, lat + dlat))
-    pts.append(pts[0])
-    return "POLYGON((" + ",".join(f"{x:.5f} {y:.5f}" for x, y in pts) + "))"
-
-
 def gbif(lat, lon, r_km, year):
     try:
-        params = {
-            "geometry": circle_wkt(lat, lon, r_km),
-            "year": f"{year - 2},{year + 2}",
-            "kingdomKey": 1,  # Animalia
-            "hasCoordinate": "true",
-            "limit": 0,
-            "facet": "SPECIES_KEY",
-            "facetLimit": 1000,
-        }
+        params = {"geometry": circle_wkt(lat, lon, r_km),
+                  "year": f"{year - 2},{year + 2}", "kingdomKey": 1,
+                  "hasCoordinate": "true", "limit": 0,
+                  "facet": "SPECIES_KEY", "facetLimit": 1000}
         j = requests.get("https://api.gbif.org/v1/occurrence/search",
                          params=params, timeout=60).json()
         sp = len(j["facets"][0]["counts"]) if j.get("facets") else 0
@@ -189,61 +225,192 @@ def gbif(lat, lon, r_km, year):
         return None
 
 
+def osm_lines(lat, lon, r_km):
+    """Major roads and canals/rivers (current OSM) in Web-Mercator coords."""
+    out = {"major": [], "minor": [], "water": []}
+    r = int(r_km * 1000)
+    hw = ("motorway|trunk|primary|secondary" if r_km > 10
+          else "motorway|trunk|primary|secondary|tertiary")
+    q = (f'[out:json][timeout:30];('
+         f'way["highway"~"^({hw})$"](around:{r},{lat},{lon});'
+         f'way["waterway"~"^(river|canal)$"](around:{r},{lat},{lon});'
+         f');out geom;')
+    try:
+        j = requests.post("https://overpass-api.de/api/interpreter",
+                          data={"data": q}, timeout=50).json()
+    except Exception:
+        return out
+    for el in j.get("elements", []):
+        g = el.get("geometry")
+        if not g:
+            continue
+        xy = [merc(p["lon"], p["lat"]) for p in g]
+        tags = el.get("tags", {})
+        if "waterway" in tags:
+            out["water"].append(xy)
+        elif tags.get("highway") in ("motorway", "trunk", "primary"):
+            out["major"].append(xy)
+        else:
+            out["minor"].append(xy)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Map drawing (publication style)
+# --------------------------------------------------------------------------
+def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2):
+    """panels: list of (title, png_bytes). ext = (xmin, ymin, xmax, ymax)."""
+    n = len(panels)
+    ncols = 1 if n == 1 else ncols
+    nrows = math.ceil(n / ncols)
+    xmin, ymin, xmax, ymax = ext
+    aspect = (ymax - ymin) / (xmax - xmin)
+    pw = 5.2
+    figw, figh = pw * ncols, pw * aspect * nrows + 1.0
+    fig, axes = plt.subplots(nrows, ncols, figsize=(figw, figh), dpi=150,
+                             squeeze=False)
+    cx, cy = zip(*[merc(x, y) for x, y in circle_lonlat(lat, lon, r_km)])
+    cos_lat = math.cos(math.radians(lat))
+    width_km = (xmax - xmin) * cos_lat / 1000.0
+    nice = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]
+    bar_km = max([v for v in nice if v <= 0.3 * width_km] or [nice[0]])
+    bar_frac = bar_km * 1000.0 / cos_lat / (xmax - xmin)
+
+    for i, ax in enumerate(axes.flat):
+        if i >= n:
+            ax.axis("off")
+            continue
+        title, data = panels[i]
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_aspect("equal")
+        if ctx is not None:
+            try:
+                ctx.add_basemap(ax, crs="EPSG:3857",
+                                source=ctx.providers.CartoDB.Positron,
+                                attribution=False)
+            except Exception:
+                ax.set_facecolor("#f4f4f4")
+        else:
+            ax.set_facecolor("#f4f4f4")
+        arr = np.array(PILImage.open(io.BytesIO(data)).convert("RGBA"))
+        arr = arr.astype(float)
+        arr[..., 3] *= 0.85
+        ax.imshow(arr.astype("uint8"), extent=(xmin, xmax, ymin, ymax),
+                  origin="upper", interpolation="nearest", zorder=3)
+        for key, col, lw in (("water", "#0b4ea2", 1.5),
+                             ("minor", "#9e9e9e", 0.6),
+                             ("major", "#d7191c", 1.6)):
+            if osm and osm.get(key):
+                ax.add_collection(LineCollection(osm[key], colors=col,
+                                                 linewidths=lw, zorder=4))
+        ax.plot(cx, cy, color="black", lw=1.1, ls="--", zorder=5)
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_linewidth(1.8)
+        ax.text(0.04, 0.04, title, transform=ax.transAxes, zorder=10,
+                fontsize=17 if len(title) <= 5 else 11, fontweight="bold",
+                bbox=dict(facecolor="white", edgecolor="black", pad=4))
+        ax.annotate("", xy=(0.93, 0.945), xytext=(0.93, 0.83),
+                    xycoords="axes fraction", zorder=10,
+                    arrowprops=dict(arrowstyle="-|>", color="black", lw=1.5))
+        ax.text(0.93, 0.955, "N", transform=ax.transAxes, ha="center",
+                fontsize=10, fontweight="bold", zorder=10)
+        ax.plot([0.94 - bar_frac, 0.94], [0.06, 0.06],
+                transform=ax.transAxes, color="black", lw=3,
+                solid_capstyle="butt", zorder=10)
+        ax.text(0.94 - bar_frac / 2, 0.075, f"{bar_km:g} km",
+                transform=ax.transAxes, ha="center", fontsize=8, zorder=10,
+                bbox=dict(facecolor="white", edgecolor="none", pad=1.5,
+                          alpha=0.8))
+
+    bottom = 1.0 / figh
+    fig.tight_layout(rect=(0, bottom, 1, 1))
+    fig.legend(handles=legend, loc="lower center",
+               bbox_to_anchor=(0.5, 0.28 / figh), ncol=3, fontsize=8,
+               frameon=False)
+    fig.text(0.5, 0.06 / figh, note, ha="center", fontsize=6, color="#555555")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+MAP_NOTE = ("Land cover: Landsat (USGS/NASA), rule-based classification. "
+            "Roads (red/grey) and canals/rivers (blue lines): OpenStreetMap "
+            "contributors (current, for reference). Basemap: (c) OpenStreetMap "
+            "contributors (c) CARTO. Dashed line = study radius.")
+
+
 # --------------------------------------------------------------------------
 # Analysis
 # --------------------------------------------------------------------------
-def run_analysis(lat, lon, r_km, y1, y2, progress):
+def run_analysis(lat, lon, r_km, years, season, progress):
     region = ee.Geometry.Point([lon, lat]).buffer(r_km * 1000)
     scale = 30 if r_km <= 10 else 100
+    w, s, e, n = bbox(region)
+    rect = ee.Geometry.Rectangle([w, s, e, n], "EPSG:4326", False)
+    x0, y0 = merc(w, s)
+    x1, y1 = merc(e, n)
+    ext = (x0, y0, x1, y1)
 
-    progress("Building cloud-free composites...")
-    img1, n1 = composite(y1, region)
-    img2, n2 = composite(y2, region)
-
-    progress("Classifying land cover...")
-    c1, ndvi1 = classify(img1)
-    c2, ndvi2 = classify(img2)
-
-    progress("Measuring areas...")
-    a1 = area_by(c1, region, scale)
-    a2 = area_by(c2, region, scale)
-    for d in (a1, a2):
-        for k in CLASSES:
-            d.setdefault(k, 0.0)
-
-    trans = area_by(c1.multiply(10).add(c2), region, scale)
-    water_lost = sum(v for k, v in trans.items() if k // 10 == 1 and k % 10 != 1)
-    water_gain = sum(v for k, v in trans.items() if k // 10 != 1 and k % 10 == 1)
-    water_kept = trans.get(11, 0.0)
-
-    def mean_ndvi(n):
-        v = n.reduceRegion(ee.Reducer.mean(), region, scale, maxPixels=1e10,
-                           bestEffort=True).get("ndvi").getInfo()
-        return v
-
-    progress("Computing vegetation index...")
-    nd1, nd2 = mean_ndvi(ndvi1), mean_ndvi(ndvi2)
-
-    progress("Rendering maps...")
     vis = {"min": 1, "max": 5, "palette": PALETTE}
-    map1 = png(c1, region, vis)
-    map2 = png(c2, region, vis)
-    w1, w2 = c1.eq(1), c2.eq(1)
+    classes, areas, ndvi_mean, scenes, pngs = {}, {}, {}, {}, {}
+    for y in years:
+        progress(f"Processing {y}: composite, classification, statistics...")
+        img, k = composite(y, region, season)
+        c, nd = classify(img)
+        classes[y] = c
+        scenes[y] = k
+        a = area_by(c, region, scale)
+        for code in CLASSES:
+            a.setdefault(code, 0.0)
+        areas[y] = a
+        ndvi_mean[y] = nd.reduceRegion(
+            ee.Reducer.mean(), region, scale, maxPixels=1e10,
+            bestEffort=True).get("ndvi").getInfo()
+        pngs[y] = png(c, rect, vis)
+
+    first, last = years[0], years[-1]
+    progress("Measuring transitions and river/water change...")
+    trans = area_by(classes[first].multiply(10).add(classes[last]),
+                    region, scale)
+    water = dict(
+        lost=sum(v for k, v in trans.items() if k // 10 == 1 and k % 10 != 1),
+        gain=sum(v for k, v in trans.items() if k // 10 != 1 and k % 10 == 1),
+        kept=trans.get(11, 0.0))
+    w1, w2 = classes[first].eq(1), classes[last].eq(1)
     wchg = (ee.Image(0).where(w1.And(w2.Not()), 1)
             .where(w1.Not().And(w2), 2).where(w1.And(w2), 3))
     wchg = wchg.updateMask(wchg.gt(0)).clip(region)
-    water_map = png(wchg, region, {"min": 1, "max": 3,
-                                   "palette": ["d7191c", "33a02c", "1f78b4"]})
+    water_png = png(wchg, rect, {"min": 1, "max": 3,
+                                 "palette": ["d7191c", "33a02c", "1f78b4"]})
 
-    progress("Fetching population and wildlife data...")
-    p1, p2 = population(y1, region), population(y2, region)
-    g1, g2 = gbif(lat, lon, r_km, y1), gbif(lat, lon, r_km, y2)
+    progress("Fetching roads/canals, population and wildlife data...")
+    osm = osm_lines(lat, lon, r_km)
+    pop1, pop2 = population(first, region), population(last, region)
+    g1, g2 = gbif(lat, lon, r_km, first), gbif(lat, lon, r_km, last)
 
-    return dict(lat=lat, lon=lon, r_km=r_km, y1=y1, y2=y2, scale=scale,
-                n1=n1, n2=n2, a1=a1, a2=a2, trans=trans, nd1=nd1, nd2=nd2,
-                water=dict(lost=water_lost, gain=water_gain, kept=water_kept),
-                map1=map1, map2=map2, water_map=water_map,
-                p1=p1, p2=p2, g1=g1, g2=g2,
+    progress("Drawing maps...")
+    legend = [Patch(facecolor=CLASSES[k][1], edgecolor="black", label=CLASSES[k][0])
+              for k in sorted(CLASSES)]
+    lulc_map = draw_map([(str(y), pngs[y]) for y in years], ext, lat, lon,
+                        r_km, osm, legend, MAP_NOTE, ncols=2)
+    wlegend = [Patch(facecolor="#1f78b4", edgecolor="black", label="Unchanged water"),
+               Patch(facecolor="#d7191c", edgecolor="black", label="Water lost"),
+               Patch(facecolor="#33a02c", edgecolor="black", label="New water")]
+    water_map = draw_map([(f"{first}-{last}", water_png)], ext, lat, lon,
+                         r_km, osm, wlegend, MAP_NOTE)
+
+    dec = 3 if r_km <= 1 else 2 if r_km <= 10 else 1
+    return dict(lat=lat, lon=lon, r_km=r_km, years=years, scale=scale,
+                season=("Nov-Feb" if season else "Whole year"), dec=dec,
+                scenes=scenes, a=areas, trans=trans, ndvi=ndvi_mean,
+                water=water, lulc_map=lulc_map, water_map=water_map,
+                p1=pop1, p2=pop2, g1=g1, g2=g2,
                 created=datetime.date.today().isoformat())
 
 
@@ -252,35 +419,47 @@ def pct(a, b):
 
 
 def insights(r):
-    a1, a2 = r["a1"], r["a2"]
+    d = r["dec"]
+    y1, y2 = r["years"][0], r["years"][-1]
+    a1, a2 = r["a"][y1], r["a"][y2]
+    area = math.pi * r["r_km"] ** 2
     out = []
     v1, v2 = a1[2] + a1[3], a2[2] + a2[3]
-    out.append(
-        f"Vegetation cover changed from {v1:.1f} km2 to {v2:.1f} km2 "
-        f"({pct(v1, v2):+.1f}%). Dense vegetation changed by "
-        f"{pct(a1[2], a2[2]):+.1f}%.")
-    out.append(
-        f"Built-up area changed from {a1[4]:.1f} km2 to {a2[4]:.1f} km2 "
-        f"({a2[4] - a1[4]:+.1f} km2).")
+    out.append(f"Vegetation (dense + sparse) changed from {v1:.{d}f} km2 to "
+               f"{v2:.{d}f} km2 ({pct(v1, v2):+.1f}%). Dense vegetation "
+               f"changed by {pct(a1[2], a2[2]):+.1f}%.")
+    out.append(f"Built-up area changed from {a1[4]:.{d}f} km2 to "
+               f"{a2[4]:.{d}f} km2 ({a2[4] - a1[4]:+.{d}f} km2, "
+               f"{pct(a1[4], a2[4]):+.0f}%).")
     w = r["water"]
-    out.append(
-        f"Water surface changed from {a1[1]:.1f} km2 to {a2[1]:.1f} km2. "
-        f"About {w['lost']:.1f} km2 of former water is now land and "
-        f"{w['gain']:.1f} km2 of land is now water, which indicates "
-        f"channel or shoreline shift.")
-    if r["p1"] and r["p2"] and r["p1"]["value"] and r["p2"]["value"]:
-        out.append(
-            f"Estimated population changed from {r['p1']['value']:,.0f} "
-            f"({r['p1']['epoch']}) to {r['p2']['value']:,.0f} "
-            f"({r['p2']['epoch']}), i.e. {pct(r['p1']['value'], r['p2']['value']):+.1f}%.")
-    if r["g1"] and r["g2"]:
-        out.append(
-            f"Recorded animal species: {r['g1']['species']} around {r['y1']} "
-            f"vs {r['g2']['species']} around {r['y2']} (GBIF).")
-    loss = a1[2] - a2[2]
-    if loss > 0 and a2[4] > a1[4]:
+    if w["lost"] + w["gain"] >= 0.005 * area:
+        out.append(f"Water surface changed from {a1[1]:.{d}f} to "
+                   f"{a2[1]:.{d}f} km2. About {w['lost']:.{d}f} km2 of former "
+                   f"water is now land and {w['gain']:.{d}f} km2 of land is "
+                   f"now water, indicating channel, pond or shoreline shift.")
+    else:
+        out.append("Water bodies show no significant change in this period.")
+    p1, p2 = r["p1"], r["p2"]
+    if p1 and p2 and p1["value"] and p2["value"]:
+        out.append(f"Modelled population estimate changed from "
+                   f"{p1['value']:,.0f} ({p1['epoch']}) to {p2['value']:,.0f} "
+                   f"({p2['epoch']}), {pct(p1['value'], p2['value']):+.1f}%.")
+    g1, g2 = r["g1"], r["g2"]
+    if g1 and g2:
+        if g1["records"] == 0 and g2["records"] == 0:
+            out.append("No GBIF animal records exist for these time windows, "
+                       "so wildlife trends cannot be assessed (this does not "
+                       "mean there is no wildlife).")
+        else:
+            out.append(f"Recorded animal species (GBIF): {g1['species']} "
+                       f"around {y1} vs {g2['species']} around {y2}.")
+    if a1[2] - a2[2] > 0 and a2[4] > a1[4]:
         out.append("Dense vegetation loss together with built-up growth "
                    "suggests habitat fragmentation pressure on wildlife.")
+    if abs(pct(a1[2], a2[2])) > 30:
+        out.append("Note: a large change in dense vegetation can partly "
+                   "reflect differences in image dates and sensors; verify "
+                   "with local knowledge.")
     return out
 
 
@@ -288,15 +467,18 @@ def insights(r):
 # PDF
 # --------------------------------------------------------------------------
 def chart_bytes(r):
-    labels = [CLASSES[k][0] for k in sorted(CLASSES)]
-    x = range(len(labels))
+    codes = sorted(CLASSES)
+    years = r["years"]
+    shades = plt.cm.Blues(np.linspace(0.35, 0.95, len(years)))
     fig, ax = plt.subplots(figsize=(7.5, 3.6), dpi=150)
-    ax.bar([i - 0.2 for i in x], [r["a1"][k] for k in sorted(CLASSES)], 0.4,
-           label=str(r["y1"]), color="#7f8fa6")
-    ax.bar([i + 0.2 for i in x], [r["a2"][k] for k in sorted(CLASSES)], 0.4,
-           label=str(r["y2"]), color="#273c75")
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+    bw = 0.8 / len(years)
+    for j, y in enumerate(years):
+        xs = [i - 0.4 + bw * (j + 0.5) for i in range(len(codes))]
+        ax.bar(xs, [r["a"][y][k] for k in codes], bw, label=str(y),
+               color=shades[j])
+    ax.set_xticks(range(len(codes)))
+    ax.set_xticklabels([CLASSES[k][0] for k in codes], rotation=20,
+                       ha="right", fontsize=8)
     ax.set_ylabel("Area (km2)")
     ax.set_title("Land cover area by class")
     ax.legend()
@@ -309,17 +491,26 @@ def chart_bytes(r):
     return buf
 
 
+def img_flow(data, width_cm):
+    w, h = PILImage.open(io.BytesIO(data)).size
+    return Image(io.BytesIO(data), width=width_cm * cm,
+                 height=width_cm * cm * h / w)
+
+
 def build_pdf(r):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=2 * cm,
                             rightMargin=2 * cm, topMargin=1.8 * cm,
-                            bottomMargin=1.8 * cm,
-                            title="LULC Change Report")
+                            bottomMargin=1.8 * cm, title="LULC Change Report")
     ss = getSampleStyleSheet()
     h1 = ParagraphStyle("h1", parent=ss["Title"], fontSize=20, spaceAfter=4)
-    h2 = ParagraphStyle("h2", parent=ss["Heading2"], textColor=colors.HexColor("#273c75"))
+    h2 = ParagraphStyle("h2", parent=ss["Heading2"],
+                        textColor=colors.HexColor("#273c75"))
     body = ParagraphStyle("b", parent=ss["BodyText"], fontSize=9.5, leading=13)
     small = ParagraphStyle("s", parent=body, fontSize=8, textColor=colors.grey)
+    d = r["dec"]
+    years = r["years"]
+    y1, y2 = years[0], years[-1]
 
     def tbl(data, widths=None):
         t = Table(data, colWidths=widths, repeatRows=1)
@@ -334,88 +525,90 @@ def build_pdf(r):
         ]))
         return t
 
-    s = []
-    s.append(Paragraph("Land Use / Land Cover Change Report", h1))
-    s.append(Paragraph(f"{SITE_NAME} | generated {r['created']}", small))
-    s.append(Spacer(1, 8))
-    s.append(tbl([["Parameter", "Value"],
-                  ["Latitude / Longitude", f"{r['lat']:.5f} / {r['lon']:.5f}"],
-                  ["Radius", f"{r['r_km']} km"],
-                  ["Period", f"{r['y1']} to {r['y2']}"],
-                  ["Landsat scenes used", f"{r['n1']} / {r['n2']}"],
-                  ["Analysis resolution", f"{r['scale']} m"]],
-                 [6 * cm, 10 * cm]))
+    s = [Paragraph("Land Use / Land Cover Change Report", h1),
+         Paragraph(f"{SITE_NAME} | generated {r['created']}", small),
+         Spacer(1, 8),
+         tbl([["Parameter", "Value"],
+              ["Latitude / Longitude", f"{r['lat']:.5f} / {r['lon']:.5f}"],
+              ["Radius", f"{r['r_km']} km"],
+              ["Years analysed", ", ".join(str(y) for y in years)],
+              ["Image season", r["season"]],
+              ["Landsat scenes used", " / ".join(str(r["scenes"][y]) for y in years)],
+              ["Analysis resolution", f"{r['scale']} m"]],
+             [6 * cm, 11 * cm])]
 
     s.append(Paragraph("1. Summary of findings", h2))
     for line in insights(r):
         s.append(Paragraph("&bull; " + line, body))
 
-    s.append(Paragraph("2. Land cover change", h2))
-    rows = [["Class", f"{r['y1']} km2", f"{r['y2']} km2", "Change km2", "Change %"]]
+    s.append(KeepTogether([Paragraph("2. Land cover maps", h2),
+                           img_flow(r["lulc_map"], 17)]))
+
+    s.append(Paragraph("3. Land cover change", h2))
+    head = ["Class"] + [f"{y} km2" for y in years] + ["Change km2", "Change %"]
+    rows = [head]
     for k in sorted(CLASSES):
-        a, b = r["a1"][k], r["a2"][k]
-        rows.append([CLASSES[k][0], f"{a:.2f}", f"{b:.2f}", f"{b - a:+.2f}",
-                     f"{pct(a, b):+.1f}"])
-    s.append(tbl(rows, [6 * cm, 2.5 * cm, 2.5 * cm, 2.6 * cm, 2.4 * cm]))
+        a, b = r["a"][y1][k], r["a"][y2][k]
+        rows.append([CLASSES[k][0]] + [f"{r['a'][y][k]:.{d}f}" for y in years]
+                    + [f"{b - a:+.{d}f}", f"{pct(a, b):+.1f}"])
+    first_w = 5.2 * cm
+    rest = (17 * cm - first_w) / (len(head) - 1)
+    s.append(tbl(rows, [first_w] + [rest] * (len(head) - 1)))
     s.append(Spacer(1, 6))
     s.append(Image(chart_bytes(r), width=15 * cm, height=7.2 * cm))
-    s.append(Paragraph(f"Mean NDVI: {r['nd1']:.3f} ({r['y1']}) to "
-                       f"{r['nd2']:.3f} ({r['y2']}).", body))
+    s.append(Paragraph("Mean NDVI: " + ", ".join(
+        f"{r['ndvi'][y]:.3f} ({y})" for y in years) + ".", body))
 
-    maps = Table([[Image(io.BytesIO(r["map1"]), 7.6 * cm, 7.6 * cm),
-                   Image(io.BytesIO(r["map2"]), 7.6 * cm, 7.6 * cm)],
-                  [f"Land cover {r['y1']}", f"Land cover {r['y2']}"]])
-    maps.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                              ("FONTSIZE", (0, 1), (-1, 1), 8)]))
-    s.append(Spacer(1, 6))
-    s.append(maps)
-    leg = "  ".join(f'<font color="{CLASSES[k][1]}">&#9632;</font> {CLASSES[k][0]}'
-                    for k in sorted(CLASSES))
-    s.append(Paragraph(leg, small))
-
-    s.append(Paragraph("3. River path and water bodies", h2))
+    s.append(Paragraph("4. River path and water bodies", h2))
     w = r["water"]
     s.append(Paragraph(
-        f"Unchanged water: {w['kept']:.2f} km2. Water lost (now land): "
-        f"{w['lost']:.2f} km2. New water: {w['gain']:.2f} km2.", body))
-    s.append(Image(io.BytesIO(r["water_map"]), 8 * cm, 8 * cm))
-    s.append(Paragraph('<font color="#1f78b4">&#9632;</font> unchanged &nbsp; '
-                       '<font color="#d7191c">&#9632;</font> lost &nbsp; '
-                       '<font color="#33a02c">&#9632;</font> new', small))
+        f"{y1} to {y2}: unchanged water {w['kept']:.{d}f} km2, water lost "
+        f"(now land) {w['lost']:.{d}f} km2, new water {w['gain']:.{d}f} km2.",
+        body))
+    s.append(KeepTogether([img_flow(r["water_map"], 9.5)]))
 
-    s.append(Paragraph("4. Population", h2))
+    s.append(Paragraph("5. Population", h2))
     if r["p1"] and r["p2"]:
         s.append(tbl([["Epoch", "Estimated population"],
                       [str(r["p1"]["epoch"]), f"{r['p1']['value']:,.0f}"],
                       [str(r["p2"]["epoch"]), f"{r['p2']['value']:,.0f}"]],
                      [6 * cm, 6 * cm]))
-        s.append(Paragraph("Source: JRC Global Human Settlement Layer "
-                           "(GHS-POP), nearest 5-year epoch.", small))
+        s.append(Paragraph(
+            "Source: JRC Global Human Settlement Layer (GHS-POP), nearest "
+            "5-year epoch. Values are modelled estimates; uncertainty is high "
+            "at small radii.", small))
     else:
         s.append(Paragraph("Population data unavailable for this request.", body))
 
-    s.append(Paragraph("5. Wildlife (indicative)", h2))
+    s.append(Paragraph("6. Wildlife (indicative)", h2))
     if r["g1"] and r["g2"]:
         s.append(tbl([["Window", "Animal records", "Species"],
-                      [f"{r['y1'] - 2}-{r['y1'] + 2}", str(r["g1"]["records"]), str(r["g1"]["species"])],
-                      [f"{r['y2'] - 2}-{r['y2'] + 2}", str(r["g2"]["records"]), str(r["g2"]["species"])]],
+                      [f"{y1 - 2}-{y1 + 2}", str(r["g1"]["records"]), str(r["g1"]["species"])],
+                      [f"{y2 - 2}-{y2 + 2}", str(r["g2"]["records"]), str(r["g2"]["species"])]],
                      [6 * cm, 5 * cm, 5 * cm]))
+        extra = ""
+        if r["g1"]["records"] == 0 and r["g2"]["records"] == 0:
+            extra = ("No records were found in GBIF for these windows; this "
+                     "does not mean there is no wildlife. ")
         s.append(Paragraph(
-            "Source: GBIF occurrence records. These reflect observation "
-            "effort as much as real animal numbers, so read them together "
-            "with the habitat (vegetation and water) change above.", small))
+            extra + "Source: GBIF occurrence records. Counts reflect "
+            "observation effort as much as real animal numbers, so read them "
+            "together with the habitat (vegetation and water) change.", small))
     else:
         s.append(Paragraph("Wildlife records unavailable for this request.", body))
 
-    s.append(Paragraph("6. Method and limitations", h2))
+    s.append(Paragraph("7. Method and limitations", h2))
     s.append(Paragraph(
         "Land cover is derived from cloud-masked Landsat 5/7/8/9 Collection 2 "
-        "Level-2 surface reflectance (median of the year before, the year, and "
-        "the year after). Classes use index thresholds: NDVI (vegetation), "
-        "MNDWI (water) and NDBI (built-up). This is a rule-based "
-        "classification, not field-verified; accuracy is lower for early "
-        "years, small features, and areas with heavy cloud or seasonal "
-        "flooding. Use results as a screening-level analysis.", body))
+        "Level-2 surface reflectance (median composite of the year before, "
+        "the year, and the year after, restricted to the chosen season). "
+        "Classes use index thresholds: NDVI (vegetation), MNDWI (water) and "
+        "NDBI (built-up). This is a rule-based classification at 30 m "
+        "resolution, not field-verified; accuracy is lower for early years, "
+        "small features (narrow canals, small ponds), and areas with heavy "
+        "cloud or seasonal flooding. Roads and canals drawn on the maps come "
+        "from current OpenStreetMap data and are shown for orientation only. "
+        "Use results as a screening-level analysis.", body))
 
     doc.build(s)
     buf.seek(0)
@@ -428,23 +621,25 @@ def build_pdf(r):
 st.set_page_config(page_title="LULC Change Analyzer", page_icon="🛰️",
                    layout="centered")
 st.title("🛰️ LULC Change Analyzer")
-st.caption("Land use and land cover change over 10 years for any location.")
+st.caption("Land use and land cover change for any location, with maps and a PDF report.")
 
 with st.form("inputs"):
     c1, c2 = st.columns(2)
-    lat = c1.number_input("Latitude", -90.0, 90.0, 22.5726, format="%.5f")
-    lon = c2.number_input("Longitude", -180.0, 180.0, 88.3639, format="%.5f")
+    lat = c1.number_input("Latitude", -90.0, 90.0, 23.07357, format="%.5f")
+    lon = c2.number_input("Longitude", -180.0, 180.0, 88.53253, format="%.5f")
     c3, c4 = st.columns(2)
     period = c3.selectbox("Period", list(PERIODS))
     radius = c4.selectbox("Radius (km)", RADII_KM)
+    season_label = st.selectbox("Image season", list(SEASONS))
     go = st.form_submit_button("Analyze", type="primary")
 
 if go:
     try:
         init_ee()
-        y1, y2 = PERIODS[period]
-        with st.status("Analyzing...", expanded=True) as status:
-            res = run_analysis(lat, lon, radius, y1, y2,
+        years = PERIODS[period]
+        with st.status("Analyzing (this can take 1-5 minutes)...",
+                       expanded=True) as status:
+            res = run_analysis(lat, lon, radius, years, SEASONS[season_label],
                                lambda m: st.write(m))
             res["pdf"] = build_pdf(res)
             status.update(label="Done", state="complete")
@@ -457,9 +652,8 @@ if res:
     st.subheader("Findings")
     for line in insights(res):
         st.markdown(f"- {line}")
-    st.image([res["map1"], res["map2"]],
-             caption=[f"Land cover {res['y1']}", f"Land cover {res['y2']}"])
-    st.image(res["water_map"], caption="Water change (blue unchanged, red lost, green new)")
+    st.image(res["lulc_map"], use_container_width=True)
+    st.image(res["water_map"], use_container_width=True)
     st.download_button("⬇️ Download PDF report", res["pdf"],
-                       file_name=f"LULC_{res['y1']}_{res['y2']}.pdf",
+                       file_name=f"LULC_{res['years'][0]}_{res['years'][-1]}.pdf",
                        mime="application/pdf", type="primary")
