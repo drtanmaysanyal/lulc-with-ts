@@ -1,5 +1,5 @@
 """
-LULC Change Analysis Tool  (v2: publication-style maps)
+LULC Change Analysis Tool  (v3 BETA: Random Forest + GHSL built-up)
 -------------------------------------------------------
 User gives latitude, longitude, a period and a radius.
 Google Earth Engine (Landsat) -> land cover for each year -> change statistics,
@@ -44,11 +44,12 @@ BOTTLE = "#0B5D45"   # bottle green
 BEIGE = "#F5F0E1"    # beige
 
 CLASSES = {
-    1: ("Water / pond / river", "#1f78b4"),
-    2: ("Dense vegetation", "#1b7837"),
-    3: ("Sparse vegetation / cropland", "#a6d96a"),
-    4: ("Built-up / settlement", "#e6550d"),
-    5: ("Bare land / other", "#f2e394"),
+    1: ("Water / wetland", "#1f78b4"),
+    2: ("Tree cover / forest", "#1b7837"),
+    3: ("Shrub & grassland", "#a6d96a"),
+    4: ("Cropland", "#ffe066"),
+    5: ("Built-up / settlement", "#e6550d"),
+    6: ("Bare land", "#d2b48c"),
 }
 PALETTE = [CLASSES[k][1].lstrip("#") for k in sorted(CLASSES)]
 
@@ -77,6 +78,13 @@ SEASONS = {
 # (Roy et al. 2016, OLS): ETM+ = slope * OLI + intercept, bands blue..swir2
 OLI_SLOPE = [0.8474, 0.8483, 0.9047, 0.8462, 0.8937, 0.9071]
 OLI_INTERCEPT = [0.0003, 0.0088, 0.0061, 0.0412, 0.0254, 0.0172]
+# ESA WorldCover (2020) classes -> our classes. Built-up (50) is excluded from
+# training because built-up comes from JRC GHSL for every year.
+WC_FROM = [80, 90, 10, 95, 20, 30, 40, 60]
+WC_TO = [1, 1, 2, 2, 3, 3, 4, 6]
+TRAIN_CLASSES = [1, 2, 3, 4, 6]
+FEATURES = NAMES + ["ndvi", "mndwi", "ndbi"]
+BUILT_MIN = 1000  # GHSL built_surface (m2 per 100 m cell) above this = built-up
 RADII_KM = [5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 R_EARTH = 6378137.0
 
@@ -172,17 +180,57 @@ def composite(year, region, season, win=1):
     return merged.median().clip(region), n
 
 
-def classify(img):
-    ndvi = img.normalizedDifference(["nir", "red"])
-    mndwi = img.normalizedDifference(["green", "swir1"])
-    ndbi = img.normalizedDifference(["swir1", "nir"])
-    c = ee.Image(5)
-    c = c.where(ndvi.gte(0.25).And(ndvi.lt(0.5)), 3)
-    c = c.where(ndvi.gte(0.5), 2)
-    c = c.where(ndvi.lt(0.25).And(ndbi.gt(0)), 4)
-    c = c.where(mndwi.gt(0.1).And(ndvi.lt(0.3)), 1)
-    c = c.rename("lulc").toInt().updateMask(img.select("red").mask())
-    return c, ndvi.rename("ndvi")
+def features(img):
+    ndvi = img.normalizedDifference(["nir", "red"]).rename("ndvi")
+    mndwi = img.normalizedDifference(["green", "swir1"]).rename("mndwi")
+    ndbi = img.normalizedDifference(["swir1", "nir"]).rename("ndbi")
+    return img.addBands([ndvi, mndwi, ndbi])
+
+
+def train_model(train_img, region, scale):
+    """Random Forest trained on ESA WorldCover 2020 labels (30% held out)."""
+    wc = ee.ImageCollection("ESA/WorldCover/v100").first().select("Map")
+    label = wc.remap(WC_FROM, WC_TO).rename("label")
+    stack = features(train_img).select(FEATURES).addBands(label)
+    samples = stack.stratifiedSample(
+        numPoints=0, classBand="label", region=region, scale=scale,
+        classValues=TRAIN_CLASSES, classPoints=[400] * len(TRAIN_CLASSES),
+        seed=42, tileScale=4, dropNulls=True)
+    n = samples.size().getInfo()
+    if n < 100:
+        raise RuntimeError("Too few training samples for this location "
+                           "(try a larger radius or a different season).")
+    samples = samples.randomColumn("rnd", 7)
+    tr = samples.filter(ee.Filter.lt("rnd", 0.7))
+    te = samples.filter(ee.Filter.gte("rnd", 0.7))
+    clf = ee.Classifier.smileRandomForest(numberOfTrees=100, seed=7).train(
+        tr, "label", FEATURES)
+    em = te.classify(clf).errorMatrix("label", "classification")
+    return clf, {"overall": em.accuracy().getInfo(),
+                 "kappa": em.kappa().getInfo(), "n": n}
+
+
+def built_image(year):
+    epoch = min(max(int(round(year / 5.0)) * 5, 1975), 2030)
+    return ee.Image(f"JRC/GHSL/P2023A/GHS_BUILT_S/{epoch}").select(
+        "built_surface")
+
+
+def built_surface_km2(year, region):
+    try:
+        v = built_image(year).reduceRegion(
+            ee.Reducer.sum(), region, 100, maxPixels=1e10,
+            bestEffort=True).get("built_surface").getInfo()
+        return v / 1e6 if v is not None else None
+    except Exception:
+        return None
+
+
+def classify_year(img, clf, year):
+    """Random Forest classes + built-up painted from JRC GHSL."""
+    rf = features(img).select(FEATURES).classify(clf)
+    c = rf.where(built_image(year).gt(BUILT_MIN), 5)
+    return c.rename("lulc").toInt().updateMask(img.select("red").mask())
 
 
 def area_by(code_img, region, scale):
@@ -362,7 +410,7 @@ def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2):
     return buf.getvalue()
 
 
-MAP_NOTE = (f"{SITE_NAME} | Land cover: Landsat (USGS/NASA), rule-based classification. "
+MAP_NOTE = (f"{SITE_NAME} | Land cover: Landsat (USGS/NASA), Random Forest (ESA WorldCover training); built-up: JRC GHSL. "
             "Roads (red/grey) and canals/rivers (blue lines): OpenStreetMap "
             "contributors (current, for reference). Basemap: Esri, HERE, Garmin, "
             "OpenStreetMap contributors. Dashed line = study radius.")
@@ -381,21 +429,29 @@ def run_analysis(lat, lon, r_km, years, season, progress):
     x1, y1 = merc(e, n)
     ext = (x0, y0, x1, y1)
 
-    vis = {"min": 1, "max": 5, "palette": PALETTE}
-    classes, areas, ndvi_mean, scenes, pngs = {}, {}, {}, {}, {}
+    vis = {"min": 1, "max": 6, "palette": PALETTE}
+    progress("Building cloud-free composites...")
+    imgs, scenes = {}, {}
     for y in years:
-        progress(f"Processing {y}: composite, classification, statistics...")
-        img, k = composite(y, region, season, win)
-        c, nd = classify(img)
+        imgs[y], scenes[y] = composite(y, region, season, win)
+    train_img = (imgs[2020] if 2020 in imgs
+                 else composite(2020, region, season, win)[0])
+    progress("Training Random Forest on ESA WorldCover labels...")
+    clf, acc = train_model(train_img, region, scale)
+
+    classes, areas, ndvi_mean, pngs, built = {}, {}, {}, {}, {}
+    for y in years:
+        progress(f"Classifying and measuring {y}...")
+        c = classify_year(imgs[y], clf, y)
         classes[y] = c
-        scenes[y] = k
         a = area_by(c, region, scale)
         for code in CLASSES:
             a.setdefault(code, 0.0)
         areas[y] = a
-        ndvi_mean[y] = nd.reduceRegion(
+        ndvi_mean[y] = features(imgs[y]).select("ndvi").reduceRegion(
             ee.Reducer.mean(), region, scale, maxPixels=1e10,
             bestEffort=True).get("ndvi").getInfo()
+        built[y] = built_surface_km2(y, region)
         pngs[y] = png(c, rect, vis)
 
     first, last = years[0], years[-1]
@@ -438,7 +494,7 @@ def run_analysis(lat, lon, r_km, years, season, progress):
                 season=("Nov-Feb" if season else "Whole year"), dec=dec,
                 scenes=scenes, a=areas, trans=trans, ndvi=ndvi_mean,
                 water=water, lulc_map=lulc_map, water_map=water_map,
-                p1=pop1, p2=pop2, g1=g1, g2=g2,
+                p1=pop1, p2=pop2, g1=g1, g2=g2, acc=acc, built=built,
                 created=datetime.date.today().isoformat())
 
 
@@ -450,26 +506,26 @@ def reliability_flags(r):
     """Plausibility checks: flag results that look like classification artefacts."""
     y1, y2 = r["years"][0], r["years"][-1]
     a1, a2 = r["a"][y1], r["a"][y2]
+    area = math.pi * r["r_km"] ** 2
     flags = []
+    acc = r.get("acc")
+    if acc and acc["overall"] < 0.75:
+        flags.append(f"Classification accuracy is low "
+                     f"({acc['overall'] * 100:.0f}%); treat class areas as "
+                     "rough estimates.")
     p1, p2 = r["p1"], r["p2"]
     pop_up = bool(p1 and p2 and p1["value"] and p2["value"]
                   and p2["value"] >= p1["value"])
-    if pct(a1[4], a2[4]) < -30 and pop_up:
-        flags.append("Built-up area decreased sharply while population "
-                     "did not; this is very likely a classification "
-                     "inconsistency between the two years (sensor, season "
-                     "or thresholds), not a real change.")
-    dense = pct(a1[2], a2[2])
-    if dense > 100 or dense < -60:
-        flags.append(f"Dense vegetation changed by {dense:+.0f}%, which is "
-                     "unusually large and probably reflects different image "
-                     "dates, sensors or crop stage rather than real land "
-                     "change.")
-    if abs(r["ndvi"][y2] - r["ndvi"][y1]) > 0.08:
-        flags.append("Mean NDVI differs strongly between the two years; "
-                     "treat the vegetation numbers as unreliable until "
-                     "checked against local knowledge or high-resolution "
-                     "imagery.")
+    b1, b2 = r["built"].get(y1), r["built"].get(y2)
+    if b1 and b2 and pct(b1, b2) < -20 and pop_up:
+        flags.append("Built-up surface decreased while population did not; "
+                     "check the input data for this location.")
+    for name, code in (("Tree cover", 2), ("Cropland", 4)):
+        ch = pct(a1[code], a2[code])
+        if max(a1[code], a2[code]) > 0.03 * area and (ch > 100 or ch < -60):
+            flags.append(f"{name} changed by {ch:+.0f}%, which is unusually "
+                         "large and may reflect different image dates or "
+                         "sensors rather than real land change.")
     return flags
 
 
@@ -479,13 +535,19 @@ def insights(r):
     a1, a2 = r["a"][y1], r["a"][y2]
     area = math.pi * r["r_km"] ** 2
     out = ["RELIABILITY WARNING: " + f for f in reliability_flags(r)]
-    v1, v2 = a1[2] + a1[3], a2[2] + a2[3]
-    out.append(f"Vegetation (dense + sparse) changed from {v1:.{d}f} km2 to "
-               f"{v2:.{d}f} km2 ({pct(v1, v2):+.1f}%). Dense vegetation "
-               f"changed by {pct(a1[2], a2[2]):+.1f}%.")
-    out.append(f"Built-up area changed from {a1[4]:.{d}f} km2 to "
-               f"{a2[4]:.{d}f} km2 ({a2[4] - a1[4]:+.{d}f} km2, "
-               f"{pct(a1[4], a2[4]):+.0f}%).")
+    out.append(f"Tree cover changed from {a1[2]:.{d}f} km2 to {a2[2]:.{d}f} "
+               f"km2 ({pct(a1[2], a2[2]):+.1f}%); shrub and grassland from "
+               f"{a1[3]:.{d}f} to {a2[3]:.{d}f} km2; cropland from "
+               f"{a1[4]:.{d}f} to {a2[4]:.{d}f} km2 "
+               f"({pct(a1[4], a2[4]):+.1f}%).")
+    b1, b2 = r["built"].get(y1), r["built"].get(y2)
+    if b1 is not None and b2 is not None:
+        out.append(f"Built-up surface (JRC GHSL) changed from {b1:.{d}f} km2 "
+                   f"to {b2:.{d}f} km2 ({b2 - b1:+.{d}f} km2, "
+                   f"{pct(b1, b2):+.0f}%).")
+    else:
+        out.append(f"Built-up area changed from {a1[5]:.{d}f} km2 to "
+                   f"{a2[5]:.{d}f} km2.")
     w = r["water"]
     if w["lost"] + w["gain"] >= 0.005 * area:
         out.append(f"Water surface changed from {a1[1]:.{d}f} to "
@@ -513,13 +575,15 @@ def insights(r):
                            "growing citizen-science observation effort "
                            "(e.g. eBird, iNaturalist), not necessarily more "
                            "wildlife.")
-    if a1[2] - a2[2] > 0 and a2[4] > a1[4]:
-        out.append("Dense vegetation loss together with built-up growth "
-                   "suggests habitat fragmentation pressure on wildlife.")
-    if abs(pct(a1[2], a2[2])) > 30:
-        out.append("Note: a large change in dense vegetation can partly "
-                   "reflect differences in image dates and sensors; verify "
-                   "with local knowledge.")
+    if a1[2] - a2[2] > 0 and b1 is not None and b2 is not None and b2 > b1:
+        out.append("Tree cover loss together with built-up growth suggests "
+                   "habitat pressure on wildlife.")
+    acc = r.get("acc")
+    if acc:
+        out.append(f"Classification accuracy on held-out points: "
+                   f"{acc['overall'] * 100:.0f}% (kappa {acc['kappa']:.2f}). "
+                   "Earlier years use a model trained on 2020 data, so older "
+                   "maps carry more uncertainty.")
     return out
 
 
@@ -574,7 +638,7 @@ def _page_mark(canvas, doc):
     canvas.saveState()
     canvas.setFont("Helvetica", 8)
     canvas.setFillColor(colors.HexColor("#555555"))
-    canvas.drawString(2 * cm, 1 * cm, f"{SITE_NAME}  |  LULC Change Report")
+    canvas.drawString(2 * cm, 1 * cm, f"{SITE_NAME}  |  LULC Change Report (Beta)")
     canvas.drawRightString(w - 2 * cm, 1 * cm, f"Page {doc.page}")
     canvas.restoreState()
 
@@ -607,8 +671,8 @@ def build_pdf(r):
         ]))
         return t
 
-    s = [Paragraph("Land Use / Land Cover Change Report", h1),
-         Paragraph(f"{SITE_NAME} | generated {r['created']}", small),
+    s = [Paragraph("Land Use / Land Cover Change Report (Beta)", h1),
+         Paragraph(f"{SITE_NAME} | generated {r['created']} | Beta version: indicative results, under validation", small),
          Spacer(1, 8),
          tbl([["Parameter", "Value"],
               ["Latitude / Longitude", f"{r['lat']:.5f} / {r['lon']:.5f}"],
@@ -616,7 +680,11 @@ def build_pdf(r):
               ["Years analysed", ", ".join(str(y) for y in years)],
               ["Image season", r["season"]],
               ["Landsat scenes used", " / ".join(str(r["scenes"][y]) for y in years)],
-              ["Analysis resolution", f"{r['scale']} m"]],
+              ["Analysis resolution", f"{r['scale']} m"],
+              ["Classifier", "Random Forest (100 trees), ESA WorldCover 2020 labels"],
+              ["Accuracy (held-out points)",
+               f"{r['acc']['overall'] * 100:.1f}% (kappa {r['acc']['kappa']:.2f}, "
+               f"{r['acc']['n']} samples)"]],
              [6 * cm, 11 * cm])]
 
     s.append(Paragraph("1. Summary of findings", h2))
@@ -636,6 +704,14 @@ def build_pdf(r):
     first_w = 5.2 * cm
     rest = (17 * cm - first_w) / (len(head) - 1)
     s.append(tbl(rows, [first_w] + [rest] * (len(head) - 1)))
+    bl = [f"{y}: {r['built'][y]:.{d}f} km2" for y in years
+          if r["built"].get(y) is not None]
+    if bl:
+        s.append(Spacer(1, 4))
+        s.append(Paragraph(
+            "Built-up surface (JRC GHSL, actual built area): " + ", ".join(bl)
+            + ". The built-up class in the table counts whole 100 m cells "
+            "with at least 10% built surface, so it is larger.", small))
     s.append(Spacer(1, 6))
     s.append(Image(chart_bytes(r), width=15 * cm, height=7.2 * cm))
     s.append(Paragraph("Mean NDVI: " + ", ".join(
@@ -681,18 +757,21 @@ def build_pdf(r):
 
     s.append(Paragraph("7. Method and limitations", h2))
     s.append(Paragraph(
-        "Land cover is derived from cloud-masked Landsat 5/7/8/9 Collection 2 "
-        "Level-2 surface reflectance (median composite of the year before, "
-        "the year, and the year after, restricted to the chosen season). "
-        "Landsat 8/9 reflectance is adjusted to Landsat 5/7 equivalent values "
-        "(Roy et al. 2016) so different decades are comparable. "
-        "Classes use index thresholds: NDVI (vegetation), MNDWI (water) and "
-        "NDBI (built-up). This is a rule-based classification at 30 m "
-        "resolution, not field-verified; accuracy is lower for early years, "
-        "small features (narrow canals, small ponds), and areas with heavy "
-        "cloud or seasonal flooding. Roads and canals drawn on the maps come "
-        "from current OpenStreetMap data and are shown for orientation only. "
-        "Use results as a screening-level analysis.", body))
+        "Land cover is classified with a Random Forest model (100 trees) "
+        "trained on ESA WorldCover 2020 labels using cloud-masked Landsat "
+        "5/7/8/9 Collection 2 Level-2 reflectance (median composite of the "
+        "year before, the year, and the year after, restricted to the chosen "
+        "season; Landsat 8/9 adjusted to Landsat 5/7 equivalent values, Roy "
+        "et al. 2016) plus NDVI, MNDWI and NDBI. Built-up land comes from the "
+        "JRC Global Human Settlement Layer (GHS-BUILT-S, 5-year epochs; a "
+        "100 m cell counts as built-up above 10% built surface). Accuracy is "
+        "measured on 30% held-out sample points of the training year (a "
+        "random split, so it is optimistic). Earlier decades are classified "
+        "by applying the 2020-trained model to older imagery, which adds "
+        "uncertainty, and the 30 m resolution cannot resolve narrow canals or "
+        "small ponds. Roads and canals drawn on the maps come from current "
+        "OpenStreetMap data and are shown for orientation only. This is a "
+        "beta, screening-level analysis, not field-verified.", body))
 
     doc.build(s, onFirstPage=_page_mark, onLaterPages=_page_mark)
     buf.seek(0)
@@ -702,7 +781,7 @@ def build_pdf(r):
 # --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
-st.set_page_config(page_title="LULC Change Analyzer | www.tanmaysanyal.in",
+st.set_page_config(page_title="LULC Change Analyzer (Beta) | www.tanmaysanyal.in",
                    page_icon="🛰️", layout="centered")
 
 THEME_CSS = """
@@ -729,6 +808,10 @@ div[data-testid="stDownloadButton"] > button:hover { background: #08473A; }
                margin-bottom: 16px; }
 .site-banner .t { color: #F5F0E1 !important; font-size: 1.9rem;
                   font-weight: 700; line-height: 1.2; }
+.site-banner .beta { background: #F5F0E1; color: #0B5D45 !important;
+                     font-size: 0.7rem; font-weight: 800; padding: 2px 9px;
+                     border-radius: 999px; margin-left: 10px;
+                     vertical-align: middle; letter-spacing: 1px; }
 .site-banner .s { color: #E7DDBF !important; font-size: 0.95rem;
                   margin-top: 4px; }
 .site-footer { position: fixed; left: 0; right: 0; bottom: 0; z-index: 1000;
@@ -741,12 +824,14 @@ div[data-testid="stDownloadButton"] > button:hover { background: #08473A; }
 """
 st.markdown(THEME_CSS, unsafe_allow_html=True)
 st.markdown(
-    '<div class="site-banner"><div class="t">🛰️ LULC Change Analyzer</div>'
+    '<div class="site-banner"><div class="t">🛰️ LULC Change Analyzer<span class="beta">BETA</span></div>'
     '<div class="s">Land use &amp; land cover change tool &nbsp;|&nbsp; '
     '<b>www.tanmaysanyal.in</b></div></div>', unsafe_allow_html=True)
 st.markdown(
     '<div class="site-footer">www.tanmaysanyal.in &nbsp;·&nbsp; '
-    'LULC Change Analyzer</div>', unsafe_allow_html=True)
+    'LULC Change Analyzer (Beta)</div>', unsafe_allow_html=True)
+
+st.caption("Beta version: results are screening-level and still under testing.")
 
 with st.form("inputs"):
     c1, c2 = st.columns(2)
