@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import math
+import re
 import textwrap
 
 import ee
@@ -155,9 +156,20 @@ def to_jpeg(png_bytes, quality=90):
 @st.cache_resource(show_spinner=False)
 def init_ee():
     info = dict(st.secrets["gee_service_account"])
+    missing = [k for k in ("project_id", "private_key", "client_email")
+               if not info.get(k)]
+    if missing:
+        raise RuntimeError(
+            "The Earth Engine key in Streamlit Secrets is incomplete; "
+            "missing: " + ", ".join(missing) + ". Check the "
+            "[gee_service_account] block.")
     creds = ee.ServiceAccountCredentials(info["client_email"],
                                          key_data=json.dumps(info))
     ee.Initialize(creds, project=info["project_id"])
+    try:
+        ee.data.setDeadline(600000)   # allow long computations (10 min)
+    except Exception:
+        pass
     return True
 
 
@@ -222,26 +234,31 @@ def features(img):
 
 
 def train_model(train_img, region):
-    """Random Forest trained on ESA WorldCover 2020 labels (30% held out)."""
+    """Random Forest trained on ESA WorldCover 2020 labels (30% held out).
+
+    The sample table is fetched to Python once and sent back as constants, so
+    later requests (areas, maps) do not re-run the sampling over the region.
+    """
     wc = ee.ImageCollection("ESA/WorldCover/v100").first().select("Map")
     label = wc.remap(WC_FROM, WC_TO).rename("label")
     stack = features(train_img).select(FEATURES).addBands(label)
     samples = stack.stratifiedSample(
         numPoints=0, classBand="label", region=region, scale=SCALE,
-        classValues=TRAIN_CLASSES, classPoints=[500] * len(TRAIN_CLASSES),
-        seed=42, tileScale=4, dropNulls=True)
-    n = samples.size().getInfo()
-    if n < 100:
+        classValues=TRAIN_CLASSES, classPoints=[400] * len(TRAIN_CLASSES),
+        seed=42, tileScale=4, dropNulls=True).randomColumn("rnd", 7)
+    feats = samples.getInfo().get("features", [])
+    if len(feats) < 100:
         raise RuntimeError("Too few training samples for this location "
                            "(try a larger radius or another image season).")
-    samples = samples.randomColumn("rnd", 7)
-    tr = samples.filter(ee.Filter.lt("rnd", 0.7))
-    te = samples.filter(ee.Filter.gte("rnd", 0.7))
+    fc = ee.FeatureCollection(
+        [ee.Feature(None, f["properties"]) for f in feats])
+    tr = fc.filter(ee.Filter.lt("rnd", 0.7))
+    te = fc.filter(ee.Filter.gte("rnd", 0.7))
     clf = ee.Classifier.smileRandomForest(numberOfTrees=100, seed=7).train(
         tr, "label", FEATURES)
     em = te.classify(clf).errorMatrix("label", "classification")
     return clf, {"overall": em.accuracy().getInfo(),
-                 "kappa": em.kappa().getInfo(), "n": n}
+                 "kappa": em.kappa().getInfo(), "n": len(feats)}
 
 
 def built_image(year):
@@ -321,13 +338,19 @@ def bbox(region):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def png(img, rect, vis, dim=1400):
+def png(img, rect, vis, dim=1000):
     url = img.visualize(**vis).getThumbURL(
         {"region": rect, "dimensions": dim, "crs": "EPSG:3857",
          "format": "png"})
-    resp = requests.get(url, timeout=180)
-    resp.raise_for_status()
-    return resp.content
+    last = None
+    for _ in range(2):                      # one retry for slow renders
+        try:
+            resp = requests.get(url, timeout=600)
+            resp.raise_for_status()
+            return resp.content
+        except Exception as e:
+            last = e
+    raise last
 
 
 def population(year, region):
@@ -975,6 +998,12 @@ def mem_store():
     return {}
 
 
+def _check(r):
+    """Like raise_for_status, but keeps the server's explanation."""
+    if r.status_code >= 400:
+        raise RuntimeError(f"{r.status_code}: {r.text[:300]}")
+
+
 def make_key(lat, lon, period, radius, season):
     """One unique record per (lat, lon, period, radius, season)."""
     raw = f"{APP_VERSION}|{lat:.5f}|{lon:.5f}|{period}|{radius}|{season}"
@@ -995,7 +1024,7 @@ def load_record(key):
                          params={"cache_key": f"eq.{key}", "select": "*",
                                  "limit": 1},
                          headers=_hdr(), timeout=60)
-        r.raise_for_status()
+        _check(r)
         rows = r.json()
     except Exception as e:
         st.warning(f"Could not read saved reports: {e}")
@@ -1033,34 +1062,71 @@ def save_record(view):
             json=payload, timeout=120,
             headers=_hdr({"Content-Type": "application/json",
                           "Prefer": "resolution=ignore-duplicates,return=minimal"}))
-        r.raise_for_status()
+        _check(r)
         return True
     except Exception as e:
         st.warning(f"The report could not be saved to the database: {e}")
         return False
 
 
-def list_history(limit=20):
+@st.cache_resource
+def mem_usage():
+    return []
+
+
+def log_usage(user, action, key, p):
+    """Record who used the tool (private; never shown to other users)."""
+    row = {"name": user["name"], "email": user["email"], "age": user["age"],
+           "consent": True, "action": action, "cache_key": key,
+           "lat": p["lat"], "lon": p["lon"], "period": p["period"],
+           "radius_km": p["radius_km"], "season": p["season"]}
     if not db_enabled():
-        rows = [dict(v) for v in mem_store().values()]
-        rows.sort(key=lambda v: v["created"], reverse=True)
-        return rows[:limit]
+        mem_usage().append(dict(row, used_at=datetime.datetime.utcnow()
+                                .strftime("%Y-%m-%d %H:%M UTC")))
+        return
     url, _ = _sb()
     try:
-        r = requests.get(
-            f"{url}/rest/v1/analyses",
-            params={"select": "cache_key,created_at,lat,lon,period,"
-                              "radius_km,season,status",
-                    "order": "created_at.desc", "limit": limit},
-            headers=_hdr(), timeout=60)
-        r.raise_for_status()
-        return [{"key": x["cache_key"], "created": _fmt_time(x["created_at"]),
-                 "lat": x["lat"], "lon": x["lon"], "period": x["period"],
-                 "radius_km": x["radius_km"], "season": x["season"],
-                 "status": x["status"]} for x in r.json()]
+        r = requests.post(
+            f"{url}/rest/v1/usage_log", json=row, timeout=30,
+            headers=_hdr({"Content-Type": "application/json",
+                          "Prefer": "return=minimal"}))
+        _check(r)
     except Exception as e:
-        st.warning(f"Could not load report history: {e}")
-        return []
+        st.warning(f"Usage could not be logged: {e}")
+
+
+def list_history(email, limit=20):
+    """Reports this email address created or opened (newest first)."""
+    if not db_enabled():
+        raw = [x for x in mem_usage() if x["email"] == email
+               and x["action"] in ("analysis", "cache_hit")]
+        raw.sort(key=lambda x: x["used_at"], reverse=True)
+        raw = [dict(x, created=x["used_at"]) for x in raw]
+    else:
+        url, _ = _sb()
+        try:
+            r = requests.get(
+                f"{url}/rest/v1/usage_log",
+                params={"select": "cache_key,used_at,lat,lon,period,"
+                                  "radius_km,season",
+                        "email": f"eq.{email}",
+                        "action": "in.(analysis,cache_hit)",
+                        "order": "used_at.desc", "limit": 100},
+                headers=_hdr(), timeout=60)
+            _check(r)
+            raw = [dict(x, created=_fmt_time(x["used_at"])) for x in r.json()]
+        except Exception as e:
+            st.warning(f"Could not load report history: {e}")
+            return []
+    seen, out = set(), []
+    for x in raw:
+        if x["cache_key"] in seen:
+            continue
+        seen.add(x["cache_key"])
+        out.append({"key": x["cache_key"], "created": x["created"],
+                    "lat": x["lat"], "lon": x["lon"], "period": x["period"],
+                    "radius_km": x["radius_km"], "season": x["season"]})
+    return out[:limit]
 
 
 # --------------------------------------------------------------------------
@@ -1169,6 +1235,56 @@ def render_view(view, ctx):
                "under Previous reports.")
 
 
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def user_gate():
+    """Ask who is using the tool once per session. Returns the user or None."""
+    if st.session_state.get("user"):
+        return st.session_state["user"]
+    st.markdown("### Before you start")
+    st.caption("Please tell us who is using this tool. Your name, email and "
+               "age are stored privately by the site owner to understand who "
+               "uses the tool. They are never shown to other users.")
+    with st.form("user_form"):
+        name = st.text_input("Full name")
+        email = st.text_input("Email")
+        age = st.number_input("Age", min_value=1, max_value=120, value=None,
+                              step=1)
+        agree = st.checkbox(
+            "I agree that my name, email and age are stored by "
+            "www.tanmaysanyal.in for this purpose.")
+        ok = st.form_submit_button("Continue", type="primary")
+    if ok:
+        name, email = name.strip(), email.strip().lower()
+        if len(name) < 2:
+            st.error("Please enter your full name.")
+        elif not EMAIL_RE.match(email):
+            st.error("Please enter a valid email address.")
+        elif age is None:
+            st.error("Please enter your age.")
+        elif age < 18:
+            st.error("This tool is for users aged 18 or above. Your details "
+                     "were not stored.")
+        elif not agree:
+            st.error("Please tick the consent box to continue.")
+        else:
+            st.session_state["user"] = {"name": name, "email": email,
+                                        "age": int(age)}
+            st.rerun()
+    return None
+
+
+user = user_gate()
+if user is None:
+    st.stop()
+_c1, _c2 = st.columns([4, 1])
+_c1.caption(f"Signed in as {user['name']}")
+if _c2.button("Not you?", key="switch_user"):
+    st.session_state["user"] = None
+    st.session_state["view"] = None
+    st.rerun()
+
 with st.form("inputs"):
     c1, c2 = st.columns(2)
     c1.number_input("Latitude", -90.0, 90.0, step=0.0001, format="%.5f",
@@ -1186,8 +1302,11 @@ if go:
     period, radius = st.session_state["in_period"], st.session_state["in_radius"]
     season_label = st.session_state["in_season"]
     key = make_key(lat, lon, period, radius, season_label)
+    params = {"lat": lat, "lon": lon, "period": period,
+              "radius_km": radius, "season": season_label}
     saved = load_record(key)
     if saved:
+        log_usage(user, "cache_hit", key, params)
         st.session_state["view"] = saved
     else:
         try:
@@ -1205,6 +1324,7 @@ if go:
                     "water_map": res["water_map"], "pdf": pdf,
                     "cached": False}
             save_record(view)
+            log_usage(user, "analysis", key, params)
             st.session_state["view"] = view
         except Exception as e:
             st.error(f"Something went wrong: {e}")
@@ -1212,18 +1332,23 @@ if go:
 if st.session_state.get("view"):
     render_view(st.session_state["view"], "main")
 
-st.markdown("### Previous reports")
-_rows = list_history()
+st.markdown("### Your previous reports")
+_rows = list_history(user["email"])
 if not _rows:
-    st.caption("No saved reports yet.")
+    st.caption("No saved reports yet for your email.")
 for _row in _rows:
     a, b = st.columns([4, 1])
     a.markdown(f"**{_row['created']}** · {_row['lat']:.4f}, {_row['lon']:.4f} "
                f"· {_row['radius_km']} km · {_row['period']} · "
-               f"{_row['season']} · {_row['status']}")
+               f"{_row['season']}")
     if b.button("Open", key=f"open_{_row['key']}"):
         v = load_record(_row["key"])
         if v:
             v["cached"] = True
+            log_usage(user, "history_open", _row["key"],
+                      {"lat": _row["lat"], "lon": _row["lon"],
+                       "period": _row["period"],
+                       "radius_km": _row["radius_km"],
+                       "season": _row["season"]})
             st.session_state["view"] = v
             st.rerun()
