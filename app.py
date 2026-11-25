@@ -1,12 +1,12 @@
 """
-LULC Change Analysis Tool  (v4 BETA)
+LULC Change Analysis Tool  (v5 BETA)
 ------------------------------------
-- 10 land use / land cover classes with fixed colours
-- Random Forest (ESA WorldCover labels) + JRC GHSL settlements + JRC Global
-  Surface Water + OpenStreetMap roads/canals
+- 5 land use / land cover classes with fixed colours
+- Random Forest (ESA WorldCover labels) + JRC GHSL built-up + JRC Global
+  Surface Water
 - Quarterly / whole-year image seasons, radius 5-30 km
 - Permanent report history and result cache (Supabase), PDF with map,
-  north arrow, scale bar and 10-class legend
+  north arrow, scale bar and 5-class legend
 """
 import base64
 import datetime
@@ -26,8 +26,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.collections import LineCollection
-from matplotlib.lines import Line2D
 from matplotlib.patches import FancyBboxPatch, Patch, Rectangle
 from PIL import Image as PILImage
 from reportlab.lib import colors
@@ -46,25 +44,20 @@ except Exception:  # basemap is optional
 # Settings
 # --------------------------------------------------------------------------
 SITE_NAME = "www.tanmaysanyal.in"
-APP_VERSION = "4.0-beta"      # part of the cache key: bump to invalidate cache
+APP_VERSION = "5.0-beta"      # part of the cache key: bump to invalidate cache
 BOTTLE = "#0B5D45"
 BEIGE = "#F5F0E1"
 
-# The 10 classes (code, name, HEX, kind). Codes 1-2 are drawn as lines.
+# The 5 classes (code: name, HEX colour)
 CLASSES = {
-    1: ("Main Road", "#E31A1C", "line"),
-    2: ("Canal", "#0033CC", "line"),
-    3: ("Rural Area", "#FDAE61", "area"),
-    4: ("Vegetation", "#1B7837", "area"),
-    5: ("Pond / Lake", "#4FC3F7", "area"),
-    6: ("Urban Area", "#A63603", "area"),
-    7: ("Scrub Land", "#A6D96A", "area"),
-    8: ("Crop Land", "#FFE500", "area"),
-    9: ("Aquaculture", "#1DE9B6", "area"),
-    10: ("Open Land", "#E7298A", "area"),
+    1: ("Water Bodies", "#3186C8"),
+    2: ("Vegetation", "#267A36"),
+    3: ("Agricultural Land", "#A8C957"),
+    4: ("Built-up Area", "#D65A4A"),
+    5: ("Barren Land", "#D9B47C"),
 }
-assert len({v[1] for v in CLASSES.values()}) == 10  # all colours unique
-AREA_CODES = [k for k, v in CLASSES.items() if v[2] == "area"]
+assert len({v[1] for v in CLASSES.values()}) == 5  # all colours unique
+AREA_CODES = sorted(CLASSES)
 PALETTE = [CLASSES[k][1].lstrip("#") for k in sorted(CLASSES)]
 
 NAMES = ["blue", "green", "red", "nir", "swir1", "swir2"]
@@ -100,16 +93,17 @@ SCALE = 30  # analysis resolution in metres
 OLI_SLOPE = [0.8474, 0.8483, 0.9047, 0.8462, 0.8937, 0.9071]
 OLI_INTERCEPT = [0.0003, 0.0088, 0.0061, 0.0412, 0.0254, 0.0172]
 
-# ESA WorldCover 2020 -> training classes (vegetation, scrub, crop, open land)
+# ESA WorldCover 2020 -> training classes
+# tree cover, mangrove -> Vegetation; shrub, grass, bare/sparse -> Barren
+# Land; cropland -> Agricultural Land
 WC_FROM = [10, 95, 20, 30, 40, 60]
-WC_TO = [4, 4, 7, 7, 8, 10]
-TRAIN_CLASSES = [4, 7, 8, 10]
+WC_TO = [2, 2, 5, 5, 3, 5]
+TRAIN_CLASSES = [2, 3, 5]
 FEATURES = NAMES + ["ndvi", "mndwi", "ndbi"]
+N_TREES = 60
+PTS_PER_CLASS = 300
 
-BUILT_MIN = 1000      # GHSL built_surface (m2 per 100 m cell) => settlement
-URBAN_DENS = 0.30     # share built within 500 m: >= urban, otherwise rural
-AQUA_MAX_PX = 60      # water patch <= 60 px (~5 ha) ...
-AQUA_DENS = 0.10      # ... and >= 10% water within 500 m => aquaculture
+BUILT_MIN = 1000      # GHSL built_surface (m2 per 100 m cell) => built-up
 
 
 # --------------------------------------------------------------------------
@@ -245,7 +239,7 @@ def train_model(train_img, region):
     stack = features(train_img).select(FEATURES).addBands(label)
     samples = stack.stratifiedSample(
         numPoints=0, classBand="label", region=region, scale=SCALE,
-        classValues=TRAIN_CLASSES, classPoints=[400] * len(TRAIN_CLASSES),
+        classValues=TRAIN_CLASSES, classPoints=[PTS_PER_CLASS] * len(TRAIN_CLASSES),
         seed=42, tileScale=4, dropNulls=True).randomColumn("rnd", 7)
     feats = samples.getInfo().get("features", [])
     if len(feats) < 100:
@@ -255,7 +249,7 @@ def train_model(train_img, region):
         [ee.Feature(None, f["properties"]) for f in feats])
     tr = fc.filter(ee.Filter.lt("rnd", 0.7))
     te = fc.filter(ee.Filter.gte("rnd", 0.7))
-    clf = ee.Classifier.smileRandomForest(numberOfTrees=100, seed=7).train(
+    clf = ee.Classifier.smileRandomForest(numberOfTrees=N_TREES, seed=7).train(
         tr, "label", FEATURES)
     em = te.classify(clf).errorMatrix("label", "classification")
     m = ee.Dictionary({"o": em.accuracy(), "k": em.kappa()}).getInfo()
@@ -301,27 +295,14 @@ def water_mask(img, year, use_gsw):
 
 
 def classify_year(img, clf, year, use_gsw):
-    """Raster classes 3-10 (roads and canals are drawn from OSM lines)."""
+    """Raster classes 1-5 (water and built-up override the Random Forest)."""
     proj = ee.Projection("EPSG:3857").atScale(SCALE)
     cover = img.select("red").mask()
     rf = (features(img).select(FEATURES).classify(clf)
-          .updateMask(cover).reproject(proj))      # 4, 7, 8, 10
-    # settlements: GHSL built cells, urban vs rural by local built density
-    b = built_image(year).unmask(0)
-    built = b.gt(BUILT_MIN)
-    dens = b.divide(10000).focalMean(500, "circle", "meters")
-    urban = built.And(dens.gte(URBAN_DENS))
-    rural = built.And(dens.lt(URBAN_DENS))
-    c = rf.where(rural, 3).where(urban, 6)
-    # water: permanent water; small water clusters = aquaculture (experimental)
+          .updateMask(cover).reproject(proj))      # 2, 3, 5
+    built = built_image(year).unmask(0).gt(BUILT_MIN)
     water = water_mask(img, year, use_gsw).reproject(proj)
-    patch = water.selfMask().connectedPixelCount(maxSize=100,
-                                                 eightConnected=False)
-    small = patch.lte(AQUA_MAX_PX).unmask(0)
-    wdens = water.focalMean(500, "circle", "meters")
-    aqua = water.And(small).And(wdens.gte(AQUA_DENS))
-    pond = water.And(aqua.Not())
-    c = c.where(pond, 5).where(aqua, 9)
+    c = rf.where(built, 4).where(water, 1)
     return c.rename("lulc").toInt().updateMask(rf.mask())
 
 
@@ -368,14 +349,9 @@ def population(year, region):
 
 
 # --------------------------------------------------------------------------
-# External data: GBIF (wildlife) and OpenStreetMap (roads, canals)
+# External data: GBIF (wildlife)
 # --------------------------------------------------------------------------
 UA = {"User-Agent": f"LULC-Change-Analyzer/4.0 (+https://{SITE_NAME})"}
-OVERPASS = ["https://overpass-api.de/api/interpreter",
-            "https://overpass.kumi.systems/api/interpreter",
-            "https://overpass.private.coffee/api/interpreter"]
-
-
 def gbif(lat, lon, r_km, year):
     try:
         params = {"geometry": circle_wkt(lat, lon, r_km),
@@ -390,63 +366,13 @@ def gbif(lat, lon, r_km, year):
         return None
 
 
-def osm_lines(lat, lon, r_km):
-    """Main roads and canals (current OpenStreetMap) + lengths inside radius."""
-    out = {"road": [], "canal": [], "ok": False,
-           "road_km": None, "canal_km": None}
-    r = int(r_km * 1000)
-    q = (f'[out:json][timeout:40];('
-         f'way["highway"~"^(motorway|trunk|primary|secondary)$"]'
-         f'(around:{r},{lat},{lon});'
-         f'way["waterway"="canal"](around:{r},{lat},{lon});'
-         f');out geom;')
-    data = None
-    for url in OVERPASS:
-        try:
-            resp = requests.post(url, data={"data": q}, headers=UA, timeout=70)
-            resp.raise_for_status()
-            data = resp.json()
-            break
-        except Exception:
-            continue
-    if data is None:
-        return out
-    out["ok"] = True
-    road_km = canal_km = 0.0
-    for el in data.get("elements", []):
-        g = el.get("geometry")
-        if not g:
-            continue
-        pts = [(p["lon"], p["lat"]) for p in g]
-        length = 0.0
-        for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
-            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-            if hav_km(lon, lat, mx, my) <= r_km:
-                length += hav_km(x1, y1, x2, y2)
-        xy = [merc(x, y) for x, y in pts]
-        if el.get("tags", {}).get("waterway") == "canal":
-            out["canal"].append(xy)
-            canal_km += length
-        else:
-            out["road"].append(xy)
-            road_km += length
-    out["road_km"], out["canal_km"] = road_km, canal_km
-    return out
-
-
 # --------------------------------------------------------------------------
 # Map drawing (publication style)
 # --------------------------------------------------------------------------
 def class_legend():
-    """One entry per class (1-10): colour swatch + name."""
-    handles = []
-    for k in sorted(CLASSES):
-        name, col, kind = CLASSES[k]
-        if kind == "line":
-            handles.append(Line2D([0], [0], color=col, lw=4, label=name))
-        else:
-            handles.append(Patch(facecolor=col, edgecolor="black", label=name))
-    return handles
+    """One entry per class: colour swatch + name."""
+    return [Patch(facecolor=CLASSES[k][1], edgecolor="black",
+                  label=CLASSES[k][0]) for k in sorted(CLASSES)]
 
 
 def fetch_basemap(ext):
@@ -467,7 +393,7 @@ def fetch_basemap(ext):
     return None
 
 
-def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2,
+def draw_map(panels, ext, lat, lon, r_km, legend, note, ncols=2,
              basemap=None):
     """panels: list of (title, png_bytes). ext = (xmin, ymin, xmax, ymax)
     in Web-Mercator metres. Scale bar uses the true ground distance."""
@@ -504,11 +430,6 @@ def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2,
         arr[..., 3] *= 0.88
         ax.imshow(arr.astype("uint8"), extent=(xmin, xmax, ymin, ymax),
                   origin="upper", interpolation="nearest", zorder=3)
-        for key, code, lw in (("canal", 2, 1.5), ("road", 1, 1.7)):
-            if osm and osm.get(key):
-                ax.add_collection(LineCollection(
-                    osm[key], colors=CLASSES[code][1], linewidths=lw,
-                    zorder=4))
         ax.plot(cx, cy, color="black", lw=1.1, ls="--", zorder=5)
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
@@ -565,16 +486,15 @@ def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2,
 
 
 MAP_NOTE = (f"{SITE_NAME} | Land cover: Landsat (USGS/NASA) Random Forest "
-            "trained on ESA WorldCover; settlements: JRC GHSL; water: JRC "
-            "Global Surface Water; Main Road and Canal: OpenStreetMap "
-            "contributors (current, reference only). Basemap: Esri, HERE, "
-            "Garmin, OpenStreetMap contributors. Dashed line = study radius.")
+            "trained on ESA WorldCover; built-up: JRC GHSL; water: JRC "
+            "Global Surface Water. Basemap: Esri, HERE, Garmin, "
+            "OpenStreetMap contributors. Dashed line = study radius.")
 
 
 # --------------------------------------------------------------------------
 # Analysis
 # --------------------------------------------------------------------------
-WATER = (5, 9)
+WATER = (1,)
 
 
 def _year_task(y, region, rect, season, use_gsw, vis):
@@ -622,18 +542,17 @@ def run_analysis(lat, lon, r_km, years, period_label, season_label, progress):
     x0, y0 = merc(w, s)
     x1, y1 = merc(e, n)
     ext = (x0, y0, x1, y1)
-    vis = {"min": 1, "max": 10, "palette": PALETTE}
+    vis = {"min": 1, "max": len(CLASSES), "palette": PALETTE}
     first, last = years[0], years[-1]
     use_gsw = gsw_available()
 
     classes, areas, ndvi_mean, pngs, built, acc, scenes = (
         {}, {}, {}, {}, {}, {}, {})
     progress("Running all years in parallel (composites, Random Forest, "
-             "classification) together with roads, population, wildlife "
+             "classification) together with population, wildlife "
              "and basemap downloads...")
     with ThreadPoolExecutor(max_workers=10) as ex:
         ext_f = {
-            "osm": ex.submit(osm_lines, lat, lon, r_km),
             "pop1": ex.submit(population, first, region),
             "pop2": ex.submit(population, last, region),
             "g1": ex.submit(gbif, lat, lon, r_km, first),
@@ -654,8 +573,8 @@ def run_analysis(lat, lon, r_km, years, period_label, season_label, progress):
         tr_f = ex.submit(area_by,
                          classes[first].multiply(100).add(classes[last]),
                          region)
-        w1 = classes[first].eq(5).Or(classes[first].eq(9))
-        w2 = classes[last].eq(5).Or(classes[last].eq(9))
+        w1 = classes[first].eq(1)
+        w2 = classes[last].eq(1)
         wchg = (ee.Image(0).where(w1.And(w2.Not()), 1)
                 .where(w1.Not().And(w2), 2).where(w1.And(w2), 3))
         wchg = wchg.updateMask(wchg.gt(0)).clip(region)
@@ -663,7 +582,6 @@ def run_analysis(lat, lon, r_km, years, period_label, season_label, progress):
             "min": 1, "max": 3, "palette": ["d7191c", "33a02c", "1f78b4"]})
         trans = tr_f.result()
         water_png = wp_f.result()
-        osm = ext_f["osm"].result()
         pop1, pop2 = ext_f["pop1"].result(), ext_f["pop2"].result()
         g1, g2 = ext_f["g1"].result(), ext_f["g2"].result()
         basemap = ext_f["base"].result()
@@ -678,21 +596,19 @@ def run_analysis(lat, lon, r_km, years, period_label, season_label, progress):
 
     progress("Drawing maps...")
     lulc_map = draw_map([(str(y), pngs[y]) for y in years], ext, lat, lon,
-                        r_km, osm, class_legend(), MAP_NOTE, ncols=2,
+                        r_km, class_legend(), MAP_NOTE, ncols=2,
                         basemap=basemap)
     wlegend = [Patch(facecolor="#1f78b4", edgecolor="black", label="Unchanged water"),
                Patch(facecolor="#d7191c", edgecolor="black", label="Water lost"),
                Patch(facecolor="#33a02c", edgecolor="black", label="New water")]
     water_map = draw_map([(f"{first}-{last}", water_png)], ext, lat, lon,
-                         r_km, osm, wlegend, MAP_NOTE, basemap=basemap)
+                         r_km, wlegend, MAP_NOTE, basemap=basemap)
 
     now = datetime.datetime.utcnow()
     return dict(lat=lat, lon=lon, r_km=r_km, years=years, dec=2,
                 period=period_label, season=season_label,
                 scenes=scenes, a=areas, trans=trans, ndvi=ndvi_mean,
                 water=water, built=built, acc=acc, use_gsw=use_gsw,
-                osm_ok=osm["ok"], road_km=osm["road_km"],
-                canal_km=osm["canal_km"],
                 lulc_map=to_jpeg(lulc_map), water_map=to_jpeg(water_map),
                 p1=pop1, p2=pop2, g1=g1, g2=g2,
                 created=now.strftime("%Y-%m-%d %H:%M UTC"))
@@ -718,10 +634,10 @@ def reliability_flags(r):
     p1, p2 = r["p1"], r["p2"]
     pop_up = bool(p1 and p2 and p1["value"] and p2["value"]
                   and p2["value"] >= p1["value"])
-    if a1[6] > 0 and pct(a1[6], a2[6]) < -20 and pop_up:
-        flags.append("Urban area decreased while population did not; check "
-                     "the input data for this location.")
-    for name, code in (("Vegetation", 4), ("Crop Land", 8)):
+    if a1[4] > 0 and pct(a1[4], a2[4]) < -20 and pop_up:
+        flags.append("Built-up Area decreased while population did not; "
+                     "check the input data for this location.")
+    for name, code in (("Vegetation", 2), ("Agricultural Land", 3)):
         ch = pct(a1[code], a2[code])
         if max(a1[code], a2[code]) > 0.03 * area and (ch > 100 or ch < -60):
             flags.append(f"{name} changed by {ch:+.0f}%, which is unusually "
@@ -742,21 +658,21 @@ def insights(r):
     a1, a2 = r["a"][y1], r["a"][y2]
     area = math.pi * r["r_km"] ** 2
     out = ["RELIABILITY WARNING: " + f for f in reliability_flags(r)]
-    out.append(f"Vegetation changed from {a1[4]:.{d}f} to {a2[4]:.{d}f} km2 "
-               f"({pct(a1[4], a2[4]):+.1f}%); Scrub Land from {a1[7]:.{d}f} "
-               f"to {a2[7]:.{d}f} km2; Crop Land from {a1[8]:.{d}f} to "
-               f"{a2[8]:.{d}f} km2 ({pct(a1[8], a2[8]):+.1f}%); Open Land "
-               f"from {a1[10]:.{d}f} to {a2[10]:.{d}f} km2.")
-    out.append(f"Urban Area changed from {a1[6]:.{d}f} to {a2[6]:.{d}f} km2 "
-               f"({pct(a1[6], a2[6]):+.1f}%); Rural Area (rural settlement) "
-               f"from {a1[3]:.{d}f} to {a2[3]:.{d}f} km2.")
+    out.append(f"Vegetation changed from {a1[2]:.{d}f} to {a2[2]:.{d}f} km2 "
+               f"({pct(a1[2], a2[2]):+.1f}%); Agricultural Land from "
+               f"{a1[3]:.{d}f} to {a2[3]:.{d}f} km2 "
+               f"({pct(a1[3], a2[3]):+.1f}%); Barren Land from "
+               f"{a1[5]:.{d}f} to {a2[5]:.{d}f} km2 "
+               f"({pct(a1[5], a2[5]):+.1f}%).")
+    out.append(f"Built-up Area changed from {a1[4]:.{d}f} to {a2[4]:.{d}f} "
+               f"km2 ({pct(a1[4], a2[4]):+.1f}%).")
     b1, b2 = r["built"].get(y1), r["built"].get(y2)
     if b1 is not None and b2 is not None:
         out.append(f"Actual built surface (JRC GHSL) changed from "
                    f"{b1:.{d}f} to {b2:.{d}f} km2 ({pct(b1, b2):+.0f}%).")
-    out.append(f"Pond / Lake (including river water) changed from "
-               f"{a1[5]:.{d}f} to {a2[5]:.{d}f} km2; Aquaculture "
-               f"(experimental) from {a1[9]:.{d}f} to {a2[9]:.{d}f} km2.")
+    out.append(f"Water Bodies (river, pond, canal, lake) changed from "
+               f"{a1[1]:.{d}f} to {a2[1]:.{d}f} km2 "
+               f"({pct(a1[1], a2[1]):+.1f}%).")
     w = r["water"]
     if w["lost"] + w["gain"] >= 0.005 * area:
         out.append(f"About {w['lost']:.{d}f} km2 of former water is now "
@@ -764,14 +680,6 @@ def insights(r):
                    "indicating channel, pond or shoreline shift.")
     else:
         out.append("Water bodies show no significant change in this period.")
-    if r.get("osm_ok"):
-        out.append(f"Main Road length {r['road_km']:.1f} km and Canal length "
-                   f"{r['canal_km']:.1f} km inside the radius (current "
-                   "OpenStreetMap, not time-specific).")
-    else:
-        out.append("Main Road and Canal could not be loaded from "
-                   "OpenStreetMap this time (server did not respond); they "
-                   "are missing from the map and statistics.")
     p1, p2 = r["p1"], r["p2"]
     if p1 and p2 and p1["value"] and p2["value"]:
         out.append(f"Modelled population estimate changed from "
@@ -791,8 +699,8 @@ def insights(r):
                            "growing citizen-science observation effort "
                            "(e.g. eBird, iNaturalist), not necessarily more "
                            "wildlife.")
-    if a1[4] > 0 and pct(a1[4], a2[4]) < -5 and a2[6] > a1[6]:
-        out.append("Vegetation loss together with urban growth suggests "
+    if a1[2] > 0 and pct(a1[2], a2[2]) < -5 and a2[4] > a1[4]:
+        out.append("Vegetation loss together with built-up growth suggests "
                    "habitat pressure on wildlife.")
     acc = r.get("acc")
     if acc:
@@ -931,24 +839,15 @@ def build_pdf(r):
                     + [f"{r['a'][y][k]:.{d}f}" for y in years]
                     + [f"{b - a:+.{d}f}", f"{pct(a, b):+.1f}"])
         sw[len(rows) - 1] = CLASSES[k][1]
-    for code, key in ((1, "road_km"), (2, "canal_km")):
-        val = r.get(key)
-        txt = f"{val:.1f}" if val is not None else "n/a"
-        rows.append(["", CLASSES[code][0] + " (km)*"] + [txt] * len(years)
-                    + ["n/a", "n/a"])
-        sw[len(rows) - 1] = CLASSES[code][1]
     rest = (17 * cm - 0.5 * cm - 4.2 * cm) / (len(head) - 2)
     s.append(tbl(rows, [0.5 * cm, 4.2 * cm] + [rest] * (len(head) - 2), sw))
-    s.append(Paragraph(
-        "* Length in km from current OpenStreetMap data; roads and canals are "
-        "not time-specific, so no change is computed.", small))
     bl = [f"{y}: {r['built'][y]:.{d}f} km2" for y in years
           if r["built"].get(y) is not None]
     if bl:
         s.append(Paragraph("Actual built surface (JRC GHSL): " + ", ".join(bl)
-                           + ". Rural Area and Urban Area count whole 100 m "
-                           "cells with at least 10% built surface, so they "
-                           "are larger.", small))
+                           + ". Built-up Area counts whole 100 m cells with "
+                           "at least 10% built surface, so it is larger.",
+                           small))
     s.append(Spacer(1, 6))
     s.append(Image(chart_bytes(r), width=15 * cm, height=7.2 * cm))
     s.append(Paragraph("Mean NDVI: " + ", ".join(
@@ -959,7 +858,7 @@ def build_pdf(r):
     s.append(Paragraph(
         f"{y1} to {y2}: unchanged water {w['kept']:.{d}f} km2, water lost "
         f"(now land) {w['lost']:.{d}f} km2, new water {w['gain']:.{d}f} km2 "
-        "(Pond / Lake and Aquaculture combined).", body))
+        "(Water Bodies).", body))
     s.append(KeepTogether([img_flow(r["water_map"], 9.5)]))
 
     s.append(Paragraph("5. Population", h2))
@@ -993,19 +892,16 @@ def build_pdf(r):
 
     s.append(Paragraph("7. How reliable is each class?", h2))
     s.append(Paragraph(
-        "<b>Better supported:</b> Vegetation, Crop Land (Random Forest on "
-        "Landsat), Pond / Lake (JRC Global Surface Water, permanent water of "
-        "each year, independent of the chosen season), Urban Area (JRC "
-        "GHSL).<br/><b>Moderate:</b> Scrub Land, Open Land, Rural Area (Rural "
-        "vs Urban uses a density rule: Urban if at least 30% of the area "
-        "within 500 m is built).<br/><b>Experimental:</b> Aquaculture (small "
-        "permanent water clusters, not validated against field data).<br/>"
-        "<b>Reference only:</b> Main Road and Canal come from current "
-        "OpenStreetMap and are not time-specific.", body))
+        "<b>Better supported:</b> Water Bodies (JRC Global Surface Water, "
+        "permanent water of each year, independent of the chosen season), "
+        "Built-up Area (JRC GHSL), Vegetation and Agricultural Land (Random "
+        "Forest on Landsat).<br/><b>Moderate:</b> Barren Land (open soil, "
+        "fallow land, scrub and grass are grouped here, and fallow fields "
+        "can be confused with Agricultural Land in a single season).", body))
 
     s.append(Paragraph("8. Method and limitations", h2))
     s.append(Paragraph(
-        "Land cover is classified with a Random Forest model (100 trees) "
+        "Land cover is classified with a Random Forest model (60 trees) "
         "trained on ESA WorldCover 2020 labels using cloud-masked Landsat "
         "5/7/8/9 Collection 2 Level-2 reflectance (median composite of the "
         "year before, the year, and the year after, restricted to the chosen "
@@ -1031,7 +927,11 @@ def build_pdf(r):
 def _sb():
     try:
         s = st.secrets["supabase"]
-        return s["url"].rstrip("/"), s["key"]
+        u = str(s["url"]).strip().strip('"').strip("'")
+        m = re.match(r"^(https?://[^/\s]+)", u)   # keep only scheme + host
+        if not m:
+            return None
+        return m.group(1), str(s["key"]).strip()
     except Exception:
         return None
 
