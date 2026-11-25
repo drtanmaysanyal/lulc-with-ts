@@ -16,6 +16,7 @@ import json
 import math
 import re
 import textwrap
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ee
 import numpy as np
@@ -257,8 +258,8 @@ def train_model(train_img, region):
     clf = ee.Classifier.smileRandomForest(numberOfTrees=100, seed=7).train(
         tr, "label", FEATURES)
     em = te.classify(clf).errorMatrix("label", "classification")
-    return clf, {"overall": em.accuracy().getInfo(),
-                 "kappa": em.kappa().getInfo(), "n": len(feats)}
+    m = ee.Dictionary({"o": em.accuracy(), "k": em.kappa()}).getInfo()
+    return clf, {"overall": m["o"], "kappa": m["k"], "n": len(feats)}
 
 
 def built_image(year):
@@ -277,6 +278,7 @@ def built_surface_km2(year, region):
         return None
 
 
+@st.cache_resource(show_spinner=False)
 def gsw_available():
     try:
         ee.ImageCollection("JRC/GSW1_4/YearlyHistory").size().getInfo()
@@ -447,7 +449,26 @@ def class_legend():
     return handles
 
 
-def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2):
+def fetch_basemap(ext):
+    """Download the basemap ONCE (it is identical for every panel/map)."""
+    if ctx is None:
+        return None
+    xmin, ymin, xmax, ymax = ext
+    zoom = int(min(max(round(math.log2(
+        156543.03 * 1000.0 / (xmax - xmin))), 1), 15))
+    for provider in (ctx.providers.Esri.WorldGrayCanvas,
+                     ctx.providers.OpenStreetMap.Mapnik):
+        try:
+            img, extent = ctx.bounds2img(xmin, ymin, xmax, ymax, zoom=zoom,
+                                         source=provider, ll=False)
+            return img, extent
+        except Exception:
+            continue
+    return None
+
+
+def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2,
+             basemap=None):
     """panels: list of (title, png_bytes). ext = (xmin, ymin, xmax, ymax)
     in Web-Mercator metres. Scale bar uses the true ground distance."""
     n = len(panels)
@@ -475,17 +496,9 @@ def draw_map(panels, ext, lat, lon, r_km, osm, legend, note, ncols=2):
         ax.set_ylim(ymin, ymax)
         ax.set_aspect("equal")
         ax.set_facecolor("#f4f4f4")
-        if ctx is not None:
-            zoom = int(min(max(round(math.log2(
-                156543.03 * 1000.0 / (xmax - xmin))), 1), 15))
-            for provider in (ctx.providers.Esri.WorldGrayCanvas,
-                             ctx.providers.OpenStreetMap.Mapnik):
-                try:
-                    ctx.add_basemap(ax, crs="EPSG:3857", source=provider,
-                                    zoom=zoom, attribution=False)
-                    break
-                except Exception:
-                    continue
+        if basemap is not None:
+            ax.imshow(basemap[0], extent=basemap[1], zorder=1,
+                      interpolation="bilinear")
         arr = np.array(PILImage.open(io.BytesIO(data)).convert("RGBA"),
                        dtype=float)
         arr[..., 3] *= 0.88
@@ -564,6 +577,43 @@ MAP_NOTE = (f"{SITE_NAME} | Land cover: Landsat (USGS/NASA) Random Forest "
 WATER = (5, 9)
 
 
+def _year_task(y, region, rect, season, use_gsw, vis):
+    """Everything for one year. Runs in a worker thread (no Streamlit calls)."""
+    img, scenes = composite(y, region, season, 1)
+    clf, acc = train_model(img, region)
+    c = classify_year(img, clf, y, use_gsw)
+    ndvi_img = features(img).select("ndvi")
+    # area table, NDVI+built stats and the map PNG are independent: overlap them
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_area = ex.submit(area_by, c, region)
+        f_png = ex.submit(png, c, rect, vis)
+
+        def stats():
+            try:
+                d = ee.Dictionary({
+                    "ndvi": ndvi_img.reduceRegion(
+                        ee.Reducer.mean(), region, SCALE, maxPixels=1e10,
+                        bestEffort=True).get("ndvi"),
+                    "built": built_image(y).reduceRegion(
+                        ee.Reducer.sum(), region, 100, maxPixels=1e10,
+                        bestEffort=True).get("built_surface")}).getInfo()
+                bt = d.get("built")
+                return d.get("ndvi"), (bt / 1e6 if bt is not None else None)
+            except Exception:       # e.g. GHSL asset problem: do it separately
+                nd = ndvi_img.reduceRegion(
+                    ee.Reducer.mean(), region, SCALE, maxPixels=1e10,
+                    bestEffort=True).get("ndvi").getInfo()
+                return nd, built_surface_km2(y, region)
+        f_stats = ex.submit(stats)
+        areas = f_area.result()
+        pngb = f_png.result()
+        nd, bt = f_stats.result()
+    for code in AREA_CODES:
+        areas.setdefault(code, 0.0)
+    return dict(y=y, scenes=scenes, acc=acc, cls=c, a=areas, ndvi=nd,
+                built=bt, png=pngb)
+
+
 def run_analysis(lat, lon, r_km, years, period_label, season_label, progress):
     season = SEASONS[season_label]
     region = ee.Geometry.Point([lon, lat]).buffer(r_km * 1000)
@@ -573,33 +623,51 @@ def run_analysis(lat, lon, r_km, years, period_label, season_label, progress):
     x1, y1 = merc(e, n)
     ext = (x0, y0, x1, y1)
     vis = {"min": 1, "max": 10, "palette": PALETTE}
-
-    use_gsw = gsw_available()
-    progress("Building cloud-free composites...")
-    imgs, scenes = {}, {}
-    for y in years:
-        imgs[y], scenes[y] = composite(y, region, season, 1)
-
-    classes, areas, ndvi_mean, pngs, built, acc = {}, {}, {}, {}, {}, {}
-    for y in years:
-        progress(f"Training Random Forest for {y}...")
-        clf, acc[y] = train_model(imgs[y], region)
-        progress(f"Classifying and measuring {y}...")
-        c = classify_year(imgs[y], clf, y, use_gsw)
-        classes[y] = c
-        a = area_by(c, region)
-        for code in AREA_CODES:
-            a.setdefault(code, 0.0)
-        areas[y] = a
-        ndvi_mean[y] = features(imgs[y]).select("ndvi").reduceRegion(
-            ee.Reducer.mean(), region, SCALE, maxPixels=1e10,
-            bestEffort=True).get("ndvi").getInfo()
-        built[y] = built_surface_km2(y, region)
-        pngs[y] = png(c, rect, vis)
-
     first, last = years[0], years[-1]
-    progress("Measuring transitions and river/water change...")
-    trans = area_by(classes[first].multiply(100).add(classes[last]), region)
+    use_gsw = gsw_available()
+
+    classes, areas, ndvi_mean, pngs, built, acc, scenes = (
+        {}, {}, {}, {}, {}, {}, {})
+    progress("Running all years in parallel (composites, Random Forest, "
+             "classification) together with roads, population, wildlife "
+             "and basemap downloads...")
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        ext_f = {
+            "osm": ex.submit(osm_lines, lat, lon, r_km),
+            "pop1": ex.submit(population, first, region),
+            "pop2": ex.submit(population, last, region),
+            "g1": ex.submit(gbif, lat, lon, r_km, first),
+            "g2": ex.submit(gbif, lat, lon, r_km, last),
+            "base": ex.submit(fetch_basemap, ext),
+        }
+        year_f = {ex.submit(_year_task, y, region, rect, season, use_gsw,
+                            vis): y for y in years}
+        for f in as_completed(year_f):
+            r_ = f.result()             # re-raises worker errors
+            y = r_["y"]
+            classes[y], areas[y], ndvi_mean[y] = r_["cls"], r_["a"], r_["ndvi"]
+            built[y], pngs[y], acc[y], scenes[y] = (
+                r_["built"], r_["png"], r_["acc"], r_["scenes"])
+            progress(f"Finished {y}")
+
+        progress("Measuring transitions and river/water change...")
+        tr_f = ex.submit(area_by,
+                         classes[first].multiply(100).add(classes[last]),
+                         region)
+        w1 = classes[first].eq(5).Or(classes[first].eq(9))
+        w2 = classes[last].eq(5).Or(classes[last].eq(9))
+        wchg = (ee.Image(0).where(w1.And(w2.Not()), 1)
+                .where(w1.Not().And(w2), 2).where(w1.And(w2), 3))
+        wchg = wchg.updateMask(wchg.gt(0)).clip(region)
+        wp_f = ex.submit(png, wchg, rect, {
+            "min": 1, "max": 3, "palette": ["d7191c", "33a02c", "1f78b4"]})
+        trans = tr_f.result()
+        water_png = wp_f.result()
+        osm = ext_f["osm"].result()
+        pop1, pop2 = ext_f["pop1"].result(), ext_f["pop2"].result()
+        g1, g2 = ext_f["g1"].result(), ext_f["g2"].result()
+        basemap = ext_f["base"].result()
+
     water = dict(
         lost=sum(v for k, v in trans.items()
                  if k // 100 in WATER and k % 100 not in WATER),
@@ -607,27 +675,16 @@ def run_analysis(lat, lon, r_km, years, period_label, season_label, progress):
                  if k // 100 not in WATER and k % 100 in WATER),
         kept=sum(v for k, v in trans.items()
                  if k // 100 in WATER and k % 100 in WATER))
-    w1 = classes[first].eq(5).Or(classes[first].eq(9))
-    w2 = classes[last].eq(5).Or(classes[last].eq(9))
-    wchg = (ee.Image(0).where(w1.And(w2.Not()), 1)
-            .where(w1.Not().And(w2), 2).where(w1.And(w2), 3))
-    wchg = wchg.updateMask(wchg.gt(0)).clip(region)
-    water_png = png(wchg, rect, {"min": 1, "max": 3,
-                                 "palette": ["d7191c", "33a02c", "1f78b4"]})
-
-    progress("Fetching roads, canals, population and wildlife data...")
-    osm = osm_lines(lat, lon, r_km)
-    pop1, pop2 = population(first, region), population(last, region)
-    g1, g2 = gbif(lat, lon, r_km, first), gbif(lat, lon, r_km, last)
 
     progress("Drawing maps...")
     lulc_map = draw_map([(str(y), pngs[y]) for y in years], ext, lat, lon,
-                        r_km, osm, class_legend(), MAP_NOTE, ncols=2)
+                        r_km, osm, class_legend(), MAP_NOTE, ncols=2,
+                        basemap=basemap)
     wlegend = [Patch(facecolor="#1f78b4", edgecolor="black", label="Unchanged water"),
                Patch(facecolor="#d7191c", edgecolor="black", label="Water lost"),
                Patch(facecolor="#33a02c", edgecolor="black", label="New water")]
     water_map = draw_map([(f"{first}-{last}", water_png)], ext, lat, lon,
-                         r_km, osm, wlegend, MAP_NOTE)
+                         r_km, osm, wlegend, MAP_NOTE, basemap=basemap)
 
     now = datetime.datetime.utcnow()
     return dict(lat=lat, lon=lon, r_km=r_km, years=years, dec=2,
@@ -998,6 +1055,22 @@ def mem_store():
     return {}
 
 
+SETUP_MSG = ("The Supabase table '{t}' does not exist yet. Open Supabase > "
+             "SQL Editor, run the file setup_supabase.sql once, then reload "
+             "this app.")
+
+
+def _db_problem(e, table, what):
+    """Show one clear message (once per session) instead of raw JSON."""
+    if "PGRST205" in str(e) or "PGRST204" in str(e):
+        flag = f"warned_{table}"
+        if not st.session_state.get(flag):
+            st.session_state[flag] = True
+            st.warning(SETUP_MSG.format(t=table))
+    else:
+        st.warning(f"{what}: {e}")
+
+
 def _check(r):
     """Like raise_for_status, but keeps the server's explanation."""
     if r.status_code >= 400:
@@ -1027,7 +1100,7 @@ def load_record(key):
         _check(r)
         rows = r.json()
     except Exception as e:
-        st.warning(f"Could not read saved reports: {e}")
+        _db_problem(e, "analyses", "Could not read saved reports")
         return None
     if not rows:
         return None
@@ -1065,7 +1138,7 @@ def save_record(view):
         _check(r)
         return True
     except Exception as e:
-        st.warning(f"The report could not be saved to the database: {e}")
+        _db_problem(e, "analyses", "The report could not be saved")
         return False
 
 
@@ -1092,7 +1165,8 @@ def log_usage(user, action, key, p):
                           "Prefer": "return=minimal"}))
         _check(r)
     except Exception as e:
-        st.warning(f"Usage could not be logged: {e}")
+        _db_problem(e, "usage_log", "Usage could not be logged")
+    st.session_state.pop("hist", None)
 
 
 def list_history(email, limit=20):
@@ -1116,7 +1190,7 @@ def list_history(email, limit=20):
             _check(r)
             raw = [dict(x, created=_fmt_time(x["used_at"])) for x in r.json()]
         except Exception as e:
-            st.warning(f"Could not load report history: {e}")
+            _db_problem(e, "usage_log", "Could not load report history")
             return []
     seen, out = set(), []
     for x in raw:
@@ -1194,19 +1268,15 @@ if not db_enabled():
                "app restarts. Connect Supabase (see setup notes) to keep "
                "history permanently.")
 
-DEFAULTS = {"in_lat": 23.07357, "in_lon": 88.53253,
-            "in_period": list(PERIODS)[0], "in_radius": RADII_KM[0],
-            "in_season": list(SEASONS)[0]}
-for _k, _v in DEFAULTS.items():
-    st.session_state.setdefault(_k, _v)
 st.session_state.setdefault("view", None)
+st.session_state.setdefault("form_nonce", 0)
 
 
 def reset_after_download():
-    """Runs when the PDF download button is clicked: reset the input form.
+    """Runs when the PDF download button is clicked: reset the input form
+    (a new key suffix creates fresh widgets with their default values).
     Saved reports stay in the database / history."""
-    for k, v in DEFAULTS.items():
-        st.session_state[k] = v
+    st.session_state["form_nonce"] += 1
     st.session_state["view"] = None
 
 
@@ -1285,22 +1355,23 @@ if _c2.button("Not you?", key="switch_user"):
     st.session_state["view"] = None
     st.rerun()
 
+_n = st.session_state["form_nonce"]
 with st.form("inputs"):
     c1, c2 = st.columns(2)
-    c1.number_input("Latitude", -90.0, 90.0, step=0.0001, format="%.5f",
-                    key="in_lat")
-    c2.number_input("Longitude", -180.0, 180.0, step=0.0001, format="%.5f",
-                    key="in_lon")
+    lat = c1.number_input("Latitude", min_value=-90.0, max_value=90.0,
+                          value=23.07357, step=0.0001,
+                          format="%.5f", key=f"in_lat_{_n}")
+    lon = c2.number_input("Longitude", min_value=-180.0, max_value=180.0,
+                          value=88.53253, step=0.0001,
+                          format="%.5f", key=f"in_lon_{_n}")
     c3, c4 = st.columns(2)
-    c3.selectbox("Period", list(PERIODS), key="in_period")
-    c4.selectbox("Radius (km)", RADII_KM, key="in_radius")
-    st.selectbox("Image season", list(SEASONS), key="in_season")
+    period = c3.selectbox("Period", list(PERIODS), key=f"in_period_{_n}")
+    radius = c4.selectbox("Radius (km)", RADII_KM, key=f"in_radius_{_n}")
+    season_label = st.selectbox("Image season", list(SEASONS),
+                                key=f"in_season_{_n}")
     go = st.form_submit_button("Analyze", type="primary")
 
 if go:
-    lat, lon = st.session_state["in_lat"], st.session_state["in_lon"]
-    period, radius = st.session_state["in_period"], st.session_state["in_radius"]
-    season_label = st.session_state["in_season"]
     key = make_key(lat, lon, period, radius, season_label)
     params = {"lat": lat, "lon": lon, "period": period,
               "radius_km": radius, "season": season_label}
@@ -1333,7 +1404,11 @@ if st.session_state.get("view"):
     render_view(st.session_state["view"], "main")
 
 st.markdown("### Your previous reports")
-_rows = list_history(user["email"])
+_hk = st.session_state.get("hist")
+if not _hk or _hk[0] != user["email"]:
+    _hk = (user["email"], list_history(user["email"]))
+    st.session_state["hist"] = _hk
+_rows = _hk[1]
 if not _rows:
     st.caption("No saved reports yet for your email.")
 for _row in _rows:
